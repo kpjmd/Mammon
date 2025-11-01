@@ -55,38 +55,3 @@ addopts = "--cov=src --cov-report=html --cov-report=term-missing"
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
 ```
-
----
-
-## **Next Steps: Claude Code Initialization Prompt**
-
-Once you have these files in your repo, here's your **first prompt for Claude Code**:
-```
-I'm starting a new project called MAMMON - an autonomous DeFi yield optimizer for Base network with x402 protocol integration.
-
-Please read the following files to understand the project:
-- claude.md (master context and architecture)
-- todo.md (development roadmap)
-
-Current task: Complete the "Setup & Infrastructure" section of Phase 1.
-
-Specifically:
-1. Review the project structure in claude.md
-2. Create the initial directory structure exactly as specified
-3. Initialize Poetry with the pyproject.toml configuration
-4. Create stub files for all modules (with docstrings and type hints)
-5. Set up the basic configuration system (src/utils/config.py)
-6. Create the structured logging system (src/utils/logger.py)
-
-Security requirements:
-- Never commit secrets
-- Implement config with proper .env handling
-- Add input validation to config loader
-- Use type hints everywhere
-
-After completing these tasks, provide:
-- Summary of what was created
-- Next recommended steps
-- Any questions or concerns
-
-Let's build this correctly from the start. Security and code quality are non-negotiable.
