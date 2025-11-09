@@ -10,6 +10,26 @@ This dashboard provides a web interface for:
 import streamlit as st
 from decimal import Decimal
 from typing import Dict, List
+import os
+
+
+def get_dry_run_mode() -> bool:
+    """Check if dry-run mode is enabled."""
+    # Check environment variable
+    dry_run_env = os.getenv("DRY_RUN_MODE", "true").lower()
+    return dry_run_env in ("true", "1", "yes")
+
+
+def display_system_mode() -> None:
+    """Display prominent system mode indicator."""
+    dry_run = get_dry_run_mode()
+
+    if dry_run:
+        st.success("🔒 SYSTEM IN DRY-RUN MODE - Safe to experiment")
+        st.info("All transactions are simulated. No real funds will be moved.")
+    else:
+        st.error("⚠️ SYSTEM IN LIVE MODE - Real transactions enabled!")
+        st.warning("Transactions will use real funds. Proceed with extreme caution!")
 
 
 def main() -> None:
@@ -22,6 +42,16 @@ def main() -> None:
 
     st.title("💰 MAMMON - Autonomous DeFi Yield Optimizer")
     st.markdown("*Optimizing yields on Base network with AI*")
+
+    # Display system mode prominently at top
+    display_system_mode()
+
+    # Sidebar with mode indicator
+    with st.sidebar:
+        mode = "DRY RUN 🔒" if get_dry_run_mode() else "LIVE ⚠️"
+        st.metric("System Mode", mode)
+
+        st.markdown("---")
 
     # Sidebar navigation
     page = st.sidebar.selectbox(

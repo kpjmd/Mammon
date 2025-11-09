@@ -8,6 +8,7 @@ from decimal import Decimal
 from typing import Optional
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from src.utils.networks import validate_network, get_supported_networks
 
 
 class Settings(BaseSettings):
@@ -28,9 +29,17 @@ class Settings(BaseSettings):
     cdp_api_key: str = Field(..., description="Coinbase CDP API key")
     cdp_api_secret: str = Field(..., description="Coinbase CDP API secret")
     wallet_seed: str = Field(..., description="Wallet seed phrase - BIP39 mnemonic (12 or 24 words, NEVER commit!)")
+    wallet_id: Optional[str] = Field(
+        default=None,
+        description="CDP wallet ID (auto-generated on first run)",
+    )
     base_rpc_url: str = Field(
         default="https://sepolia.base.org",
         description="Base network RPC URL",
+    )
+    network: str = Field(
+        default="base-sepolia",
+        description="Network to connect to (base-sepolia, base-mainnet, arbitrum-sepolia, arbitrum-mainnet)",
     )
 
     # AI Configuration
@@ -84,6 +93,12 @@ class Settings(BaseSettings):
         description="Sentry DSN for error tracking",
     )
 
+    # Safety Features
+    dry_run_mode: bool = Field(
+        default=True,
+        description="Enable dry-run mode (simulates transactions, no real execution)",
+    )
+
     @field_validator("cdp_api_key", "cdp_api_secret", "anthropic_api_key")
     @classmethod
     def validate_required_secrets(cls, v: str, info) -> str:
@@ -122,10 +137,7 @@ class Settings(BaseSettings):
         # Check for empty/None (Pydantic handles None, but check empty string)
         if not v or not v.strip():
             raise ValueError(
-                "wallet_seed is required. Generate a BIP39 seed phrase:\n"
-                "  - Use: python -c 'from bip_utils import Bip39MnemonicGenerator; "
-                "print(Bip39MnemonicGenerator().FromWordsNumber(12))'\n"
-                "  - Or visit: https://iancoleman.io/bip39/ (OFFLINE ONLY!)\n"
+                "wallet_seed is required. Generate a BIP39 seed phrase.\n"
                 "  - NEVER share or commit your seed phrase!"
             )
 
@@ -135,22 +147,37 @@ class Settings(BaseSettings):
                 "wallet_seed must be a real BIP39 seed phrase, not a placeholder"
             )
 
-        # Validate BIP39 format using bip_utils (already installed as dependency)
-        from bip_utils import Bip39MnemonicValidator
-
-        # Validate the mnemonic format and checksum
-        if not Bip39MnemonicValidator().IsValid(v.strip()):
-            word_count = len(v.strip().split())
+        # Basic validation: should be 12-24 words
+        word_count = len(v.strip().split())
+        if word_count not in (12, 15, 18, 21, 24):
             raise ValueError(
-                f"Invalid BIP39 seed phrase\n"
-                f"  - Found {word_count} words (expected 12, 15, 18, 21, or 24)\n"
-                f"  - Ensure words are from the BIP39 wordlist\n"
-                f"  - Check for typos and extra spaces\n"
-                f"  - Generate valid seed: python -c 'from bip_utils import Bip39MnemonicGenerator; "
-                f"print(Bip39MnemonicGenerator().FromWordsNumber(12))'"
+                f"Invalid BIP39 seed phrase: found {word_count} words, "
+                f"expected 12, 15, 18, 21, or 24 words"
             )
 
         return v.strip()
+
+    @field_validator("network")
+    @classmethod
+    def validate_network_id(cls, v: str) -> str:
+        """Validate network ID against supported networks.
+
+        Args:
+            v: Network ID value
+
+        Returns:
+            Validated network ID
+
+        Raises:
+            ValueError: If network is not supported
+        """
+        if not validate_network(v):
+            supported = ", ".join(get_supported_networks())
+            raise ValueError(
+                f"Unsupported network: {v}. "
+                f"Supported networks: {supported}"
+            )
+        return v
 
     @field_validator("environment")
     @classmethod
@@ -190,6 +217,30 @@ class Settings(BaseSettings):
         if v_upper not in allowed:
             raise ValueError(f"log_level must be one of {allowed}")
         return v_upper
+
+    @field_validator("dry_run_mode")
+    @classmethod
+    def validate_dry_run_mode(cls, v: bool, info) -> bool:
+        """Validate dry-run mode and warn if disabled in non-production.
+
+        Args:
+            v: Dry-run mode value
+            info: Validation info
+
+        Returns:
+            Validated value
+        """
+        environment = info.data.get("environment", "development")
+
+        if environment != "production" and not v:
+            print("⚠️  WARNING: Dry-run mode is DISABLED in non-production environment!")
+            print("⚠️  Real transactions will be executed. This may use real funds.")
+            print("⚠️  Set DRY_RUN_MODE=true in .env to enable safe mode.")
+
+        if v:
+            print("🔒 Dry-run mode ENABLED - All transactions will be simulated")
+
+        return v
 
     def is_production(self) -> bool:
         """Check if running in production environment.

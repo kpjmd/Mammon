@@ -15,6 +15,66 @@ MAMMON is an autonomous AI agent that:
 
 Built for the emerging agent economy with security and autonomy as top priorities.
 
+## ✨ Recent Achievements - Sprint 3 (Phase 1C)
+
+**Sprint 3** successfully implemented **real blockchain protocol integration**! 🎉
+
+### What's New
+- ✅ **14,049 Live Pools**: Query real Aerodrome pools from Base mainnet
+- ✅ **Multi-Network Support**: Web3 infrastructure for Base + Arbitrum Sepolia
+- ✅ **Token Utilities**: ERC20 balance/metadata queries across networks
+- ✅ **Production Data**: Real reserves, fees, and token data from blockchain
+- ✅ **Read-Only Safety**: Zero risk queries, no transaction execution
+
+### Try the Demo
+
+See all Phase 1C features in action:
+```bash
+poetry run python scripts/demo_phase1c.py
+```
+
+This demonstrates:
+- ✅ Multi-network connectivity (Base + Arbitrum)
+- ✅ Real Aerodrome pool queries (14,049 pools available)
+- ✅ ERC20 token utilities (USDC, WETH)
+- ✅ Connection caching performance (~5x speedup)
+- ✅ Safety features and warnings
+
+### Code Examples
+
+```python
+# Query real Aerodrome pool data from Base mainnet
+from src.protocols.aerodrome import AerodromeProtocol
+
+protocol = AerodromeProtocol({"network": "base-mainnet", "dry_run_mode": False})
+pools = await protocol.get_pools()  # Returns real pool data!
+print(f"Found {len(pools)} pools with ${sum(p.tvl for p in pools):,.0f} TVL")
+```
+
+```python
+# Query ERC20 token metadata
+from src.tokens import ERC20Token
+
+usdc = ERC20Token("base-mainnet", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
+print(f"{usdc.get_name()}: {usdc.get_symbol()} ({usdc.get_decimals()} decimals)")
+# Output: USD Coin: USDC (6 decimals)
+```
+
+### Performance Benchmarks
+
+```bash
+# Run cache performance benchmarks
+poetry run python scripts/benchmark_cache_performance.py
+
+# Run extended benchmarks (may hit rate limits)
+poetry run python scripts/benchmark_extended.py
+```
+
+**See Sprint 3 Documentation**:
+- [`docs/phase1c_sprint3_report.md`](docs/phase1c_sprint3_report.md) - Full Sprint 3 report
+- [`docs/web3_integration_guide.md`](docs/web3_integration_guide.md) - Web3 usage guide
+- [`docs/known_issues_sprint3.md`](docs/known_issues_sprint3.md) - Known issues & solutions
+
 ## 🏗️ Architecture
 
 - **Orchestration**: LangGraph for stateful agent workflows

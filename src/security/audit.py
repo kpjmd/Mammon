@@ -5,7 +5,7 @@ operations, creating an immutable audit trail.
 """
 
 from typing import Any, Dict, Optional
-from datetime import datetime
+from datetime import datetime, UTC
 from enum import Enum
 import json
 
@@ -23,6 +23,10 @@ class AuditEventType(Enum):
     APPROVAL_REQUESTED = "approval_requested"
     RISK_ALERT = "risk_alert"
     SECURITY_VIOLATION = "security_violation"
+    WALLET_EXPORT = "wallet_export"
+    POOL_QUERY = "pool_query"
+    YIELD_SCAN = "yield_scan"
+    WALLET_INITIALIZED = "wallet_initialized"
 
 
 class AuditSeverity(Enum):
@@ -59,7 +63,7 @@ class AuditLogger:
         self.log_file = log_file
         self.database = database
 
-    def log_event(
+    async def log_event(
         self,
         event_type: AuditEventType,
         severity: AuditSeverity,
@@ -77,7 +81,7 @@ class AuditLogger:
             user: User/agent identifier
         """
         event = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "event_type": event_type.value,
             "severity": severity.value,
             "message": message,
@@ -109,7 +113,7 @@ class AuditLogger:
         """
         raise NotImplementedError("Database audit logging not yet implemented")
 
-    def log_transaction(
+    async def log_transaction(
         self,
         tx_hash: str,
         operation: str,
@@ -144,14 +148,14 @@ class AuditLogger:
             AuditSeverity.ERROR if status == "failed" else AuditSeverity.INFO
         )
 
-        self.log_event(
+        await self.log_event(
             event_type=event_type,
             severity=severity,
             message=f"Transaction {status}: {operation} for ${amount_usd}",
             metadata=metadata,
         )
 
-    def log_security_event(
+    async def log_security_event(
         self,
         event_description: str,
         severity: AuditSeverity = AuditSeverity.WARNING,
@@ -164,14 +168,14 @@ class AuditLogger:
             severity: Event severity
             **metadata: Additional context
         """
-        self.log_event(
+        await self.log_event(
             event_type=AuditEventType.SECURITY_VIOLATION,
             severity=severity,
             message=event_description,
             metadata=metadata,
         )
 
-    def log_config_change(
+    async def log_config_change(
         self,
         config_key: str,
         old_value: Any,
@@ -186,7 +190,7 @@ class AuditLogger:
             new_value: New value
             user: User making the change
         """
-        self.log_event(
+        await self.log_event(
             event_type=AuditEventType.CONFIG_CHANGED,
             severity=AuditSeverity.WARNING,
             message=f"Configuration changed: {config_key}",

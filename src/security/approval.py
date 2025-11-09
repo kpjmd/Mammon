@@ -7,7 +7,9 @@ for transactions above configured thresholds.
 from typing import Any, Callable, Dict, Optional
 from decimal import Decimal
 from enum import Enum
-from datetime import datetime
+from datetime import datetime, timedelta
+import asyncio
+import uuid
 
 
 class ApprovalStatus(Enum):
@@ -62,9 +64,8 @@ class ApprovalRequest:
         self.to_protocol = to_protocol
         self.rationale = rationale
         self.status = ApprovalStatus.PENDING
-        self.created_at = datetime.utcnow()
-        self.expires_at = datetime.utcnow()
-        # Note: datetime arithmetic should use timedelta
+        self.created_at = datetime.now()
+        self.expires_at = self.created_at + timedelta(seconds=timeout_seconds)
 
 
 class ApprovalManager:
@@ -112,6 +113,7 @@ class ApprovalManager:
         from_protocol: Optional[str],
         to_protocol: str,
         rationale: str,
+        timeout_seconds: int = 3600,
     ) -> ApprovalRequest:
         """Create an approval request.
 
@@ -121,27 +123,79 @@ class ApprovalManager:
             from_protocol: Source protocol
             to_protocol: Target protocol
             rationale: Explanation
+            timeout_seconds: Request timeout in seconds (default: 1 hour)
 
         Returns:
             Approval request
         """
-        raise NotImplementedError("Approval request creation not yet implemented")
+        # Generate unique request ID
+        request_id = str(uuid.uuid4())
+
+        # Create approval request
+        request = ApprovalRequest(
+            request_id=request_id,
+            transaction_type=transaction_type,
+            amount_usd=amount_usd,
+            from_protocol=from_protocol,
+            to_protocol=to_protocol,
+            rationale=rationale,
+            timeout_seconds=timeout_seconds,
+        )
+
+        # Store in pending requests
+        self.pending_requests[request_id] = request
+
+        return request
 
     async def wait_for_approval(
         self,
         request: ApprovalRequest,
         timeout_seconds: int = 3600,
+        poll_interval: float = 0.5,
     ) -> ApprovalStatus:
-        """Wait for user approval.
+        """Wait for user approval with timeout.
 
         Args:
             request: Approval request
             timeout_seconds: Maximum wait time
+            poll_interval: How often to check status (seconds)
 
         Returns:
-            Final approval status
+            Final approval status (APPROVED, REJECTED, or EXPIRED)
         """
-        raise NotImplementedError("Approval waiting not yet implemented")
+        start_time = datetime.now()
+        timeout = timedelta(seconds=timeout_seconds)
+
+        # If callback is provided, call it immediately
+        if self.approval_callback:
+            try:
+                approved = self.approval_callback(request)
+                if approved:
+                    request.status = ApprovalStatus.APPROVED
+                    return ApprovalStatus.APPROVED
+                else:
+                    request.status = ApprovalStatus.REJECTED
+                    return ApprovalStatus.REJECTED
+            except Exception:
+                # If callback fails, fall through to polling
+                pass
+
+        # Poll for approval status
+        while True:
+            # Check if request has been approved/rejected
+            if request.status == ApprovalStatus.APPROVED:
+                return ApprovalStatus.APPROVED
+            elif request.status == ApprovalStatus.REJECTED:
+                return ApprovalStatus.REJECTED
+
+            # Check if expired
+            elapsed = datetime.now() - start_time
+            if elapsed >= timeout or datetime.now() >= request.expires_at:
+                request.status = ApprovalStatus.EXPIRED
+                return ApprovalStatus.EXPIRED
+
+            # Wait before checking again
+            await asyncio.sleep(poll_interval)
 
     def approve_request(self, request_id: str) -> bool:
         """Approve a pending request.
@@ -152,19 +206,46 @@ class ApprovalManager:
         Returns:
             True if approved, False if not found
         """
-        raise NotImplementedError("Request approval not yet implemented")
+        if request_id not in self.pending_requests:
+            return False
 
-    def reject_request(self, request_id: str, reason: str) -> bool:
+        request = self.pending_requests[request_id]
+
+        # Can only approve pending requests
+        if request.status != ApprovalStatus.PENDING:
+            return False
+
+        # Check if expired
+        if datetime.now() >= request.expires_at:
+            request.status = ApprovalStatus.EXPIRED
+            return False
+
+        # Approve the request
+        request.status = ApprovalStatus.APPROVED
+        return True
+
+    def reject_request(self, request_id: str, reason: str = "") -> bool:
         """Reject a pending request.
 
         Args:
             request_id: Request to reject
-            reason: Rejection reason
+            reason: Optional rejection reason
 
         Returns:
             True if rejected, False if not found
         """
-        raise NotImplementedError("Request rejection not yet implemented")
+        if request_id not in self.pending_requests:
+            return False
+
+        request = self.pending_requests[request_id]
+
+        # Can only reject pending requests
+        if request.status != ApprovalStatus.PENDING:
+            return False
+
+        # Reject the request
+        request.status = ApprovalStatus.REJECTED
+        return True
 
     def get_pending_requests(self) -> list[ApprovalRequest]:
         """Get all pending approval requests.
@@ -173,3 +254,44 @@ class ApprovalManager:
             List of pending requests
         """
         return [req for req in self.pending_requests.values() if req.status == ApprovalStatus.PENDING]
+
+
+def cli_approval_callback(request: ApprovalRequest) -> bool:
+    """Simple CLI approval callback for interactive terminal use.
+
+    Prompts the user to approve or reject a transaction request.
+
+    Args:
+        request: Approval request to present
+
+    Returns:
+        True if approved, False if rejected
+
+    Example:
+        >>> manager = ApprovalManager(
+        ...     approval_threshold_usd=Decimal("100"),
+        ...     approval_callback=cli_approval_callback
+        ... )
+    """
+    print("\n" + "=" * 60)
+    print("⚠️  TRANSACTION APPROVAL REQUIRED")
+    print("=" * 60)
+    print(f"Type: {request.transaction_type}")
+    print(f"Amount: ${request.amount_usd:.2f} USD")
+    print(f"Protocol: {request.to_protocol}")
+    if request.from_protocol:
+        print(f"From Protocol: {request.from_protocol}")
+    print(f"Rationale: {request.rationale}")
+    print(f"Request ID: {request.request_id}")
+    print("=" * 60)
+
+    while True:
+        response = input("Approve this transaction? [y/N]: ").strip().lower()
+        if response in ('y', 'yes'):
+            print("✅ Transaction APPROVED")
+            return True
+        elif response in ('n', 'no', ''):
+            print("❌ Transaction REJECTED")
+            return False
+        else:
+            print("Invalid input. Please enter 'y' or 'n'.")

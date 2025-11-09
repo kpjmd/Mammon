@@ -65,7 +65,17 @@ class SpendingLimits:
         Returns:
             True if within limit, False otherwise
         """
-        raise NotImplementedError("Daily limit check not yet implemented")
+        # Calculate spending in last 24 hours
+        now = datetime.now()
+        yesterday = now - timedelta(days=1)
+
+        daily_spending = sum(
+            amount for timestamp, amount in self.spending_history
+            if timestamp >= yesterday
+        )
+
+        total_with_transaction = daily_spending + amount_usd
+        return total_with_transaction <= self.daily_limit_usd
 
     def check_weekly_limit(self, amount_usd: Decimal) -> bool:
         """Check if transaction would exceed weekly limit.
@@ -95,7 +105,10 @@ class SpendingLimits:
         Args:
             amount_usd: Transaction amount in USD
         """
-        self.spending_history.append((datetime.utcnow(), amount_usd))
+        self.spending_history.append((datetime.now(), amount_usd))
+
+        # Clean old entries (older than monthly tracking period)
+        self.cleanup_old_history()
 
     def get_spending_summary(self) -> Dict[str, Decimal]:
         """Get spending summary for different time periods.
@@ -107,7 +120,7 @@ class SpendingLimits:
 
     def cleanup_old_history(self) -> None:
         """Remove transaction history older than monthly period."""
-        cutoff = datetime.utcnow() - timedelta(days=30)
+        cutoff = datetime.now() - timedelta(days=30)
         self.spending_history = [
             (ts, amt) for ts, amt in self.spending_history if ts > cutoff
         ]

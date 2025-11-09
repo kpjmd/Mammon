@@ -44,6 +44,22 @@ def validate_ethereum_address(address: str) -> str:
     return f"0x{address}"
 
 
+def is_valid_ethereum_address(address: str) -> bool:
+    """Check if an Ethereum address is valid (helper function).
+
+    Args:
+        address: Address to check
+
+    Returns:
+        True if valid, False otherwise
+    """
+    try:
+        validate_ethereum_address(address)
+        return True
+    except ValidationError:
+        return False
+
+
 def validate_transaction_hash(tx_hash: str) -> str:
     """Validate a transaction hash format.
 
