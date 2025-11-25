@@ -49,6 +49,10 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# Watchdog configuration
+SCAN_CYCLE_TIMEOUT_SECONDS = 600  # 10 minutes max per scan cycle
+SCAN_CYCLE_WARNING_SECONDS = 300  # Warn if scan takes >5 minutes
+
 
 class AutonomousRunner:
     """Manages the 24-hour autonomous optimizer run."""
@@ -276,17 +280,33 @@ class AutonomousRunner:
         return await self._generate_summary(initial_value_usd)
 
     async def _run_scan_cycle(self) -> None:
-        """Run a single scan cycle."""
+        """Run a single scan cycle with watchdog protection."""
         self.total_scans += 1
-        scan_time = datetime.now(UTC)
+        scan_start_time = datetime.now(UTC)
 
         print(f"\n{'='*60}")
-        print(f"SCAN #{self.total_scans} at {scan_time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        print(f"SCAN #{self.total_scans} at {scan_start_time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
         print(f"{'='*60}")
 
         try:
-            # Run optimizer scan - returns List[RebalanceExecution]
-            executions = await self.scheduler.run_once()
+            # Run optimizer scan with timeout protection (watchdog)
+            logger.info(f"Starting scan cycle #{self.total_scans} with {SCAN_CYCLE_TIMEOUT_SECONDS}s watchdog timeout")
+
+            executions = await asyncio.wait_for(
+                self.scheduler.run_once(),
+                timeout=SCAN_CYCLE_TIMEOUT_SECONDS
+            )
+
+            # Check scan duration and warn if slow
+            scan_duration = (datetime.now(UTC) - scan_start_time).total_seconds()
+            if scan_duration > SCAN_CYCLE_WARNING_SECONDS:
+                logger.warning(
+                    f"⚠️  Scan cycle #{self.total_scans} took {scan_duration:.1f}s "
+                    f"(>{SCAN_CYCLE_WARNING_SECONDS}s warning threshold)"
+                )
+                print(f"⚠️  Slow scan: {scan_duration:.1f}s")
+            else:
+                logger.info(f"✅ Scan cycle #{self.total_scans} completed in {scan_duration:.1f}s")
 
             # Count successful and failed
             successful = [e for e in executions if e.success]
@@ -330,11 +350,27 @@ class AutonomousRunner:
             if not executions:
                 print("\n  No rebalance opportunities found")
 
+        except asyncio.TimeoutError:
+            scan_duration = (datetime.now(UTC) - scan_start_time).total_seconds()
+            error_msg = (
+                f"⏱️  WATCHDOG TIMEOUT: Scan cycle #{self.total_scans} exceeded "
+                f"{SCAN_CYCLE_TIMEOUT_SECONDS}s limit (ran for {scan_duration:.1f}s)"
+            )
+            logger.error(error_msg)
+            self.errors.append({
+                "timestamp": scan_start_time.isoformat(),
+                "error": error_msg,
+                "type": "watchdog_timeout",
+            })
+            print(f"\n  ❌ {error_msg}")
+            print(f"     Continuing to next scan cycle...")
+
         except Exception as e:
             logger.error(f"Error in scan cycle: {e}")
             self.errors.append({
-                "timestamp": scan_time.isoformat(),
+                "timestamp": scan_start_time.isoformat(),
                 "error": str(e),
+                "type": type(e).__name__,
             })
             print(f"\n  ❌ Error: {e}")
 

@@ -15,13 +15,14 @@ from src.protocols.moonwell import MoonwellProtocol
 from src.data.oracles import create_price_oracle
 from src.security.audit import AuditLogger, AuditEventType, AuditSeverity
 from src.utils.logger import get_logger
+from src.utils.circuit_breaker import CircuitBreaker
 
 logger = get_logger(__name__)
 
 # Circuit breaker configuration
 PROTOCOL_TIMEOUT_SECONDS = 30  # Max time for a single protocol scan
 MAX_CONSECUTIVE_FAILURES = 3  # Failures before circuit breaker activates
-CIRCUIT_BREAKER_COOLDOWN_MINUTES = 60  # How long to wait before retrying failed protocol
+CIRCUIT_BREAKER_COOLDOWN_SECONDS = 300  # 5 minutes (reduced from 60 minutes for faster recovery)
 
 
 class YieldOpportunity:
@@ -130,84 +131,21 @@ class YieldScannerAgent:
 
         self.protocols = [self.aerodrome, self.morpho, self.aave, self.moonwell]
 
-        # Circuit breaker state for each protocol
-        self._circuit_breakers: Dict[str, Dict[str, Any]] = {}
-        for protocol in self.protocols:
-            self._circuit_breakers[protocol.name] = {
-                "consecutive_failures": 0,
-                "is_open": False,
-                "opened_at": None,
-                "last_error": None,
-            }
+        # Initialize unified circuit breaker for all protocols
+        self.circuit_breaker = CircuitBreaker(
+            failure_threshold=MAX_CONSECUTIVE_FAILURES,
+            timeout_seconds=CIRCUIT_BREAKER_COOLDOWN_SECONDS,
+            reset_timeout_seconds=600,  # Reset after 10 minutes of no failures
+        )
 
         logger.info(f"YieldScannerAgent initialized with {len(self.protocols)} protocol(s)")
         logger.info(f"  - Aerodrome (DEX)")
         logger.info(f"  - Morpho (Lending)")
         logger.info(f"  - Aave V3 (Lending)")
         logger.info(f"  - Moonwell (Lending)")
+        logger.info(f"🔒 Circuit breaker: {MAX_CONSECUTIVE_FAILURES} failures, {CIRCUIT_BREAKER_COOLDOWN_SECONDS}s timeout")
         if self.dry_run_mode:
             logger.info("🔒 Scanner in DRY RUN mode - no executions will occur")
-
-    def _check_circuit_breaker(self, protocol_name: str) -> bool:
-        """Check if circuit breaker allows protocol scan.
-
-        Args:
-            protocol_name: Name of the protocol to check
-
-        Returns:
-            True if protocol can be scanned, False if circuit breaker is open
-        """
-        breaker = self._circuit_breakers[protocol_name]
-
-        # If circuit breaker is not open, allow scan
-        if not breaker["is_open"]:
-            return True
-
-        # Check if cooldown period has elapsed
-        if breaker["opened_at"]:
-            cooldown_elapsed = datetime.now(UTC) - breaker["opened_at"]
-            if cooldown_elapsed > timedelta(minutes=CIRCUIT_BREAKER_COOLDOWN_MINUTES):
-                # Reset circuit breaker
-                logger.info(f"🔄 Circuit breaker cooldown elapsed for {protocol_name}, retrying")
-                breaker["is_open"] = False
-                breaker["consecutive_failures"] = 0
-                breaker["opened_at"] = None
-                return True
-
-        # Circuit breaker is still open
-        return False
-
-    def _record_success(self, protocol_name: str) -> None:
-        """Record successful protocol scan.
-
-        Args:
-            protocol_name: Name of the protocol
-        """
-        breaker = self._circuit_breakers[protocol_name]
-        breaker["consecutive_failures"] = 0
-        breaker["is_open"] = False
-        breaker["opened_at"] = None
-        breaker["last_error"] = None
-
-    def _record_failure(self, protocol_name: str, error: str) -> None:
-        """Record failed protocol scan and potentially open circuit breaker.
-
-        Args:
-            protocol_name: Name of the protocol
-            error: Error message
-        """
-        breaker = self._circuit_breakers[protocol_name]
-        breaker["consecutive_failures"] += 1
-        breaker["last_error"] = error
-
-        if breaker["consecutive_failures"] >= MAX_CONSECUTIVE_FAILURES and not breaker["is_open"]:
-            breaker["is_open"] = True
-            breaker["opened_at"] = datetime.now(UTC)
-            logger.warning(
-                f"🔌 Circuit breaker OPENED for {protocol_name} after "
-                f"{MAX_CONSECUTIVE_FAILURES} consecutive failures. "
-                f"Will retry in {CIRCUIT_BREAKER_COOLDOWN_MINUTES} minutes."
-            )
 
     async def _scan_single_protocol(self, protocol: Any) -> List[YieldOpportunity]:
         """Scan a single protocol with timeout and circuit breaker.
@@ -222,7 +160,7 @@ class YieldScannerAgent:
         opportunities = []
 
         # Check circuit breaker
-        if not self._check_circuit_breaker(protocol.name):
+        if self.circuit_breaker.is_open(protocol.name):
             logger.warning(f"⚠️  Skipping {protocol.name} - circuit breaker is open")
             return opportunities
 
@@ -249,7 +187,7 @@ class YieldScannerAgent:
 
             # Record success
             scan_duration = (datetime.now(UTC) - start_time).total_seconds()
-            self._record_success(protocol.name)
+            self.circuit_breaker.record_success(protocol.name)
             logger.info(
                 f"✅ {protocol.name}: {len(pools)} opportunities "
                 f"(scanned in {scan_duration:.1f}s)"
@@ -258,12 +196,12 @@ class YieldScannerAgent:
         except asyncio.TimeoutError:
             error_msg = f"Timeout after {PROTOCOL_TIMEOUT_SECONDS}s"
             logger.error(f"❌ {protocol.name}: {error_msg}")
-            self._record_failure(protocol.name, error_msg)
+            self.circuit_breaker.record_failure(protocol.name, asyncio.TimeoutError(error_msg))
 
         except Exception as e:
             error_msg = str(e)
             logger.error(f"❌ {protocol.name}: {error_msg}")
-            self._record_failure(protocol.name, error_msg)
+            self.circuit_breaker.record_failure(protocol.name, e)
 
         return opportunities
 
@@ -293,18 +231,11 @@ class YieldScannerAgent:
             return_exceptions=False  # Exceptions handled in _scan_single_protocol
         )
 
-        # Flatten results and collect timing metrics
+        # Flatten results
         all_opportunities = []
-        protocol_timings = {}
 
-        for i, opportunities in enumerate(protocol_results):
-            protocol_name = self.protocols[i].name
+        for opportunities in protocol_results:
             all_opportunities.extend(opportunities)
-
-            # Check circuit breaker stats for timing
-            if protocol_name in self._circuit_breakers:
-                breaker = self._circuit_breakers[protocol_name]
-                # Timing was logged in _scan_single_protocol
 
         # Sort by APY (highest first)
         sorted_opportunities = sorted(all_opportunities, key=lambda x: x.apy, reverse=True)
