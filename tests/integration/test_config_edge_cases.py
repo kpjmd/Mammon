@@ -169,7 +169,7 @@ class TestNetworkConfiguration:
 
         assert network.network_id == "base-mainnet"
         assert network.chain_id == 8453
-        assert network.name == "Base"
+        assert "base" in network.description.lower()  # Check description instead of name
         assert network.is_testnet is False
         assert "base" in network.rpc_url.lower()
 

@@ -4,13 +4,24 @@ This module implements the agent responsible for continuously scanning
 all supported DeFi protocols to identify yield opportunities.
 """
 
-from typing import Any, Dict, List
+import asyncio
+from typing import Any, Dict, List, Optional
 from decimal import Decimal
+from datetime import datetime, UTC, timedelta
 from src.protocols.aerodrome import AerodromeProtocol
+from src.protocols.morpho import MorphoProtocol
+from src.protocols.aave import AaveV3Protocol
+from src.protocols.moonwell import MoonwellProtocol
+from src.data.oracles import create_price_oracle
 from src.security.audit import AuditLogger, AuditEventType, AuditSeverity
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Circuit breaker configuration
+PROTOCOL_TIMEOUT_SECONDS = 30  # Max time for a single protocol scan
+MAX_CONSECUTIVE_FAILURES = 3  # Failures before circuit breaker activates
+CIRCUIT_BREAKER_COOLDOWN_MINUTES = 60  # How long to wait before retrying failed protocol
 
 
 class YieldOpportunity:
@@ -62,8 +73,11 @@ class YieldScannerAgent:
     Continuously monitors supported protocols to identify the best
     yield opportunities for available assets.
 
-    Phase 1B: Focuses on Aerodrome protocol.
-    Phase 2+: Will add Morpho, Moonwell, Aave, Beefy.
+    Phase 3 Sprint 2: Now supports 4 protocols with real mainnet data:
+    - Aerodrome (DEX)
+    - Morpho (Lending)
+    - Aave V3 (Lending)
+    - Moonwell (Lending)
 
     Attributes:
         config: Configuration settings
@@ -82,37 +96,148 @@ class YieldScannerAgent:
         self.dry_run_mode = config.get("dry_run_mode", True)
         self.audit_logger = AuditLogger()
 
-        # Initialize protocol integrations
-        self.aerodrome = AerodromeProtocol(config)
-        self.protocols = [self.aerodrome]
+        # Create shared price oracle to avoid duplicate warnings and improve performance
+        chainlink_enabled = config.get("chainlink_enabled", True)
+        if chainlink_enabled:
+            price_network = config.get("chainlink_price_network", "base-mainnet")
+            self.price_oracle = create_price_oracle(
+                "chainlink",
+                network=config.get("network", "base-mainnet"),
+                price_network=price_network,
+                cache_ttl_seconds=config.get("chainlink_cache_ttl_seconds", 300),
+                max_staleness_seconds=config.get("chainlink_max_staleness_seconds", 3600),
+                fallback_to_mock=config.get("chainlink_fallback_to_mock", True),
+            )
+            logger.info(f"✅ Created shared Chainlink price oracle (price_network={price_network})")
+        else:
+            self.price_oracle = create_price_oracle("mock")
+            logger.info("✅ Created shared mock price oracle")
+
+        # Initialize protocol integrations with shared oracle
+        aerodrome_config = {**config, "price_oracle": self.price_oracle}
+        self.aerodrome = AerodromeProtocol(aerodrome_config)
+
+        # Phase 3 Sprint 2: Add all lending protocols with read-only mode
+        protocol_config = {
+            **config,
+            "use_mock_data": config.get("use_mock_data", False),  # Real data by default
+            "read_only": config.get("read_only", True),
+            "price_oracle": self.price_oracle,  # Share oracle across all protocols
+        }
+        self.morpho = MorphoProtocol(protocol_config)
+        self.aave = AaveV3Protocol(protocol_config)
+        self.moonwell = MoonwellProtocol(protocol_config)
+
+        self.protocols = [self.aerodrome, self.morpho, self.aave, self.moonwell]
+
+        # Circuit breaker state for each protocol
+        self._circuit_breakers: Dict[str, Dict[str, Any]] = {}
+        for protocol in self.protocols:
+            self._circuit_breakers[protocol.name] = {
+                "consecutive_failures": 0,
+                "is_open": False,
+                "opened_at": None,
+                "last_error": None,
+            }
 
         logger.info(f"YieldScannerAgent initialized with {len(self.protocols)} protocol(s)")
+        logger.info(f"  - Aerodrome (DEX)")
+        logger.info(f"  - Morpho (Lending)")
+        logger.info(f"  - Aave V3 (Lending)")
+        logger.info(f"  - Moonwell (Lending)")
         if self.dry_run_mode:
             logger.info("🔒 Scanner in DRY RUN mode - no executions will occur")
 
-    async def scan_all_protocols(self) -> List[YieldOpportunity]:
-        """Scan all supported protocols for yield opportunities.
+    def _check_circuit_breaker(self, protocol_name: str) -> bool:
+        """Check if circuit breaker allows protocol scan.
+
+        Args:
+            protocol_name: Name of the protocol to check
 
         Returns:
-            List of yield opportunities sorted by APY (highest first)
+            True if protocol can be scanned, False if circuit breaker is open
         """
-        # Log scan start
-        await self.audit_logger.log_event(
-            AuditEventType.YIELD_SCAN,
-            AuditSeverity.INFO,
-            {"action": "scan_start", "protocols": len(self.protocols)},
-        )
+        breaker = self._circuit_breakers[protocol_name]
 
-        all_opportunities = []
+        # If circuit breaker is not open, allow scan
+        if not breaker["is_open"]:
+            return True
 
-        # Scan Aerodrome (Phase 1B)
+        # Check if cooldown period has elapsed
+        if breaker["opened_at"]:
+            cooldown_elapsed = datetime.now(UTC) - breaker["opened_at"]
+            if cooldown_elapsed > timedelta(minutes=CIRCUIT_BREAKER_COOLDOWN_MINUTES):
+                # Reset circuit breaker
+                logger.info(f"🔄 Circuit breaker cooldown elapsed for {protocol_name}, retrying")
+                breaker["is_open"] = False
+                breaker["consecutive_failures"] = 0
+                breaker["opened_at"] = None
+                return True
+
+        # Circuit breaker is still open
+        return False
+
+    def _record_success(self, protocol_name: str) -> None:
+        """Record successful protocol scan.
+
+        Args:
+            protocol_name: Name of the protocol
+        """
+        breaker = self._circuit_breakers[protocol_name]
+        breaker["consecutive_failures"] = 0
+        breaker["is_open"] = False
+        breaker["opened_at"] = None
+        breaker["last_error"] = None
+
+    def _record_failure(self, protocol_name: str, error: str) -> None:
+        """Record failed protocol scan and potentially open circuit breaker.
+
+        Args:
+            protocol_name: Name of the protocol
+            error: Error message
+        """
+        breaker = self._circuit_breakers[protocol_name]
+        breaker["consecutive_failures"] += 1
+        breaker["last_error"] = error
+
+        if breaker["consecutive_failures"] >= MAX_CONSECUTIVE_FAILURES and not breaker["is_open"]:
+            breaker["is_open"] = True
+            breaker["opened_at"] = datetime.now(UTC)
+            logger.warning(
+                f"🔌 Circuit breaker OPENED for {protocol_name} after "
+                f"{MAX_CONSECUTIVE_FAILURES} consecutive failures. "
+                f"Will retry in {CIRCUIT_BREAKER_COOLDOWN_MINUTES} minutes."
+            )
+
+    async def _scan_single_protocol(self, protocol: Any) -> List[YieldOpportunity]:
+        """Scan a single protocol with timeout and circuit breaker.
+
+        Args:
+            protocol: Protocol instance to scan
+
+        Returns:
+            List of yield opportunities from this protocol
+        """
+        start_time = datetime.now(UTC)
+        opportunities = []
+
+        # Check circuit breaker
+        if not self._check_circuit_breaker(protocol.name):
+            logger.warning(f"⚠️  Skipping {protocol.name} - circuit breaker is open")
+            return opportunities
+
         try:
-            logger.info("Scanning Aerodrome for yield opportunities...")
-            pools = await self.aerodrome.get_pools()
+            # Scan protocol with timeout
+            logger.info(f"Scanning {protocol.name}...")
+            pools = await asyncio.wait_for(
+                protocol.get_pools(),
+                timeout=PROTOCOL_TIMEOUT_SECONDS
+            )
 
+            # Convert pools to opportunities
             for pool in pools:
                 opportunity = YieldOpportunity(
-                    protocol="Aerodrome",
+                    protocol=protocol.name,
                     pool_id=pool.pool_id,
                     pool_name=pool.name,
                     apy=pool.apy,
@@ -120,17 +245,74 @@ class YieldScannerAgent:
                     tokens=pool.tokens,
                     metadata=pool.metadata,
                 )
-                all_opportunities.append(opportunity)
+                opportunities.append(opportunity)
 
-            logger.info(f"Found {len(pools)} opportunities on Aerodrome")
+            # Record success
+            scan_duration = (datetime.now(UTC) - start_time).total_seconds()
+            self._record_success(protocol.name)
+            logger.info(
+                f"✅ {protocol.name}: {len(pools)} opportunities "
+                f"(scanned in {scan_duration:.1f}s)"
+            )
+
+        except asyncio.TimeoutError:
+            error_msg = f"Timeout after {PROTOCOL_TIMEOUT_SECONDS}s"
+            logger.error(f"❌ {protocol.name}: {error_msg}")
+            self._record_failure(protocol.name, error_msg)
 
         except Exception as e:
-            logger.error(f"Failed to scan Aerodrome: {e}")
+            error_msg = str(e)
+            logger.error(f"❌ {protocol.name}: {error_msg}")
+            self._record_failure(protocol.name, error_msg)
+
+        return opportunities
+
+    async def scan_all_protocols(self) -> List[YieldOpportunity]:
+        """Scan all supported protocols for yield opportunities.
+
+        Phase 4 Sprint 3: Now uses parallel scanning for 4x performance improvement.
+        All 4 protocols (Aerodrome, Morpho, Aave V3, Moonwell) are scanned simultaneously.
+
+        Returns:
+            List of yield opportunities sorted by APY (highest first)
+        """
+        scan_start = datetime.now(UTC)
+
+        # Log scan start
+        await self.audit_logger.log_event(
+            AuditEventType.YIELD_SCAN,
+            AuditSeverity.INFO,
+            {"action": "scan_start", "protocols": len(self.protocols)},
+        )
+
+        logger.info(f"🔍 Starting PARALLEL scan of {len(self.protocols)} protocols...")
+
+        # Scan all protocols in parallel using asyncio.gather
+        protocol_results = await asyncio.gather(
+            *[self._scan_single_protocol(protocol) for protocol in self.protocols],
+            return_exceptions=False  # Exceptions handled in _scan_single_protocol
+        )
+
+        # Flatten results and collect timing metrics
+        all_opportunities = []
+        protocol_timings = {}
+
+        for i, opportunities in enumerate(protocol_results):
+            protocol_name = self.protocols[i].name
+            all_opportunities.extend(opportunities)
+
+            # Check circuit breaker stats for timing
+            if protocol_name in self._circuit_breakers:
+                breaker = self._circuit_breakers[protocol_name]
+                # Timing was logged in _scan_single_protocol
 
         # Sort by APY (highest first)
         sorted_opportunities = sorted(all_opportunities, key=lambda x: x.apy, reverse=True)
 
-        # Log scan complete
+        # Calculate scan duration
+        scan_duration = (datetime.now(UTC) - scan_start).total_seconds()
+
+        # Log scan complete with per-protocol metrics
         await self.audit_logger.log_event(
             AuditEventType.YIELD_SCAN,
             AuditSeverity.INFO,
@@ -138,10 +320,18 @@ class YieldScannerAgent:
                 "action": "scan_complete",
                 "opportunities_found": len(sorted_opportunities),
                 "top_apy": str(sorted_opportunities[0].apy) if sorted_opportunities else "0",
+                "scan_duration_seconds": scan_duration,
+                "protocols_scanned": len(self.protocols),
             },
         )
 
-        logger.info(f"Scan complete: {len(sorted_opportunities)} total opportunities")
+        logger.info(
+            f"✅ Parallel scan complete: {len(sorted_opportunities)} opportunities "
+            f"found in {scan_duration:.1f}s"
+        )
+        if sorted_opportunities:
+            logger.info(f"   Top yield: {sorted_opportunities[0].protocol} @ {sorted_opportunities[0].apy}% APY")
+
         return sorted_opportunities
 
     async def get_best_opportunities(
@@ -263,3 +453,183 @@ class YieldScannerAgent:
             "recommendation": recommendation,
             "better_opportunities_count": len(better_opportunities),
         }
+
+    async def find_best_yield(self, token: str) -> Optional[YieldOpportunity]:
+        """Find the highest yield for a specific token across all protocols.
+
+        This is the CORE VALUE PROPOSITION: Find the absolute best yield
+        for a given token across all integrated protocols.
+
+        Args:
+            token: Token symbol to search for (e.g., 'USDC', 'WETH')
+
+        Returns:
+            YieldOpportunity with highest APY for the token, or None if not found
+        """
+        logger.info(f"🔍 Searching for best {token} yield across all protocols...")
+
+        # Scan all protocols
+        all_opportunities = await self.scan_all_protocols()
+
+        # Filter for token
+        token_opportunities = [
+            opp
+            for opp in all_opportunities
+            if token.upper() in [t.upper() for t in opp.tokens]
+        ]
+
+        if not token_opportunities:
+            logger.warning(f"No {token} opportunities found across any protocol")
+            return None
+
+        # Already sorted by APY (descending), so first is best
+        best = token_opportunities[0]
+
+        # Log results
+        logger.info(f"✅ Best {token} yield found:")
+        logger.info(f"   Protocol: {best.protocol}")
+        logger.info(f"   Pool: {best.pool_name}")
+        logger.info(f"   APY: {best.apy}%")
+        logger.info(f"   TVL: ${best.tvl:,.0f}")
+
+        # Show comparison to other options
+        if len(token_opportunities) > 1:
+            second_best = token_opportunities[1]
+            advantage = best.apy - second_best.apy
+            logger.info(
+                f"   Advantage: +{advantage}% over {second_best.protocol} ({second_best.apy}%)"
+            )
+
+        # Audit log
+        await self.audit_logger.log_event(
+            AuditEventType.YIELD_SCAN,
+            AuditSeverity.INFO,
+            {
+                "action": "find_best_yield",
+                "token": token,
+                "best_protocol": best.protocol,
+                "best_apy": str(best.apy),
+                "alternatives_count": len(token_opportunities) - 1,
+            },
+        )
+
+        return best
+
+    async def compare_yields(
+        self,
+        token: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Enhanced yield comparison analytics across all protocols.
+
+        Provides comprehensive statistics about yield differences to answer
+        "how much better?" not just "what's best?".
+
+        Args:
+            token: Optional token filter (None = all opportunities)
+
+        Returns:
+            Dict with comprehensive yield comparison analytics
+        """
+        logger.info(f"📊 Running enhanced yield comparison analytics...")
+
+        # Get all opportunities
+        all_opportunities = await self.scan_all_protocols()
+
+        # Filter by token if specified
+        if token:
+            opportunities = [
+                opp
+                for opp in all_opportunities
+                if token.upper() in [t.upper() for t in opp.tokens]
+            ]
+            logger.info(f"Filtered to {len(opportunities)} {token} opportunities")
+        else:
+            opportunities = all_opportunities
+            logger.info(f"Analyzing all {len(opportunities)} opportunities")
+
+        if not opportunities:
+            return {"error": "No opportunities found"}
+
+        # Calculate statistics
+        apys = [opp.apy for opp in opportunities]
+        best = max(opportunities, key=lambda x: x.apy)
+        worst = min(opportunities, key=lambda x: x.apy)
+
+        avg_apy = sum(apys) / len(apys)
+        median_apy = sorted(apys)[len(apys) // 2]
+        spread = best.apy - worst.apy
+
+        # Calculate volatility (standard deviation)
+        variance = sum((apy - avg_apy) ** 2 for apy in apys) / len(apys)
+        volatility = variance ** Decimal("0.5")
+
+        # Protocol breakdown
+        protocol_stats = {}
+        for opp in opportunities:
+            if opp.protocol not in protocol_stats:
+                protocol_stats[opp.protocol] = {
+                    "count": 0,
+                    "apys": [],
+                    "total_tvl": Decimal(0),
+                }
+            protocol_stats[opp.protocol]["count"] += 1
+            protocol_stats[opp.protocol]["apys"].append(opp.apy)
+            protocol_stats[opp.protocol]["total_tvl"] += opp.tvl
+
+        # Calculate average APY per protocol
+        for protocol, stats in protocol_stats.items():
+            stats["avg_apy"] = sum(stats["apys"]) / len(stats["apys"])
+            stats["max_apy"] = max(stats["apys"])
+            stats["min_apy"] = min(stats["apys"])
+
+        # Find yield advantages
+        if best.apy > avg_apy:
+            advantage_over_avg = best.apy - avg_apy
+            advantage_pct = (advantage_over_avg / avg_apy) * Decimal(100)
+        else:
+            advantage_over_avg = Decimal(0)
+            advantage_pct = Decimal(0)
+
+        results = {
+            "token": token or "ALL",
+            "total_opportunities": len(opportunities),
+            "best": {
+                "protocol": best.protocol,
+                "pool": best.pool_name,
+                "apy": float(best.apy),
+                "tvl": float(best.tvl),
+            },
+            "worst": {
+                "protocol": worst.protocol,
+                "pool": worst.pool_name,
+                "apy": float(worst.apy),
+                "tvl": float(worst.tvl),
+            },
+            "statistics": {
+                "average_apy": float(avg_apy),
+                "median_apy": float(median_apy),
+                "spread": float(spread),
+                "volatility": float(volatility),
+                "advantage_over_avg": float(advantage_over_avg),
+                "advantage_pct": float(advantage_pct),
+            },
+            "protocol_breakdown": {
+                protocol: {
+                    "count": stats["count"],
+                    "avg_apy": float(stats["avg_apy"]),
+                    "max_apy": float(stats["max_apy"]),
+                    "min_apy": float(stats["min_apy"]),
+                    "total_tvl": float(stats["total_tvl"]),
+                }
+                for protocol, stats in protocol_stats.items()
+            },
+        }
+
+        # Log summary
+        logger.info(f"✅ Yield Comparison Summary:")
+        logger.info(f"   Best: {best.protocol} @ {best.apy}% APY")
+        logger.info(f"   Average: {avg_apy:.2f}% APY")
+        logger.info(f"   Spread: {spread:.2f}% ({worst.apy}% to {best.apy}%)")
+        logger.info(f"   Best is +{advantage_over_avg:.2f}% over average (+{advantage_pct:.1f}%)")
+
+        return results

@@ -1,0 +1,18 @@
+{
+  "start_time": "2025-11-23T16:55:36.237512+00:00",
+  "end_time": "2025-11-23T17:05:43.414020+00:00",
+  "duration_hours": 0.1686601411111111,
+  "total_scans": 21,
+  "total_rebalances": 0,
+  "opportunities_found": 0,
+  "opportunities_executed": 0,
+  "opportunities_skipped": 0,
+  "total_gas_spent_usd": 0.0,
+  "initial_balance_usd": 14.398312809006452,
+  "final_balance_usd": 14.398312809006452,
+  "pnl_usd": 0.0,
+  "pnl_percent": 0.0,
+  "errors": 0,
+  "dry_run": true,
+  "performance_metrics": {}
+}

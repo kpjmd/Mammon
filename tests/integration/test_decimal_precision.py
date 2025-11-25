@@ -62,6 +62,8 @@ class TestDecimalPrecision:
         assert isinstance(is_positive, bool), "Comparison returns bool, not float"
 
     @pytest.mark.asyncio
+    @pytest.mark.slow
+    @pytest.mark.network
     async def test_aerodrome_tvl_uses_decimal(self):
         """Verify Aerodrome TVL calculations use Decimal."""
         protocol = AerodromeProtocol({

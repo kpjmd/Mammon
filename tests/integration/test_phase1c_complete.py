@@ -90,6 +90,8 @@ class TestPhase1CComplete:
             assert "Do not use for calculations" in pool.metadata["tvl_warning"]
 
     @pytest.mark.asyncio
+    @pytest.mark.slow
+    @pytest.mark.network
     async def test_end_to_end_token_query(self):
         """Test complete token query workflow."""
         # USDC on Base mainnet
@@ -113,6 +115,8 @@ class TestPhase1CComplete:
         assert symbol == symbol_again
 
     @pytest.mark.asyncio
+    @pytest.mark.slow
+    @pytest.mark.network
     async def test_complete_multi_network_workflow(self):
         """Test workflow spanning multiple networks."""
         # Step 1: Query pools from Base mainnet

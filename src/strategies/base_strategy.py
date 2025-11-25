@@ -30,6 +30,7 @@ class RebalanceRecommendation:
         expected_apy: Decimal,
         reason: str,
         confidence: int,
+        current_apy: Decimal | None = None,
     ) -> None:
         """Initialize a rebalance recommendation.
 
@@ -41,6 +42,7 @@ class RebalanceRecommendation:
             expected_apy: Expected APY
             reason: Explanation
             confidence: Confidence (0-100)
+            current_apy: Current APY (optional, for tracking)
         """
         self.from_protocol = from_protocol
         self.to_protocol = to_protocol
@@ -49,6 +51,7 @@ class RebalanceRecommendation:
         self.expected_apy = expected_apy
         self.reason = reason
         self.confidence = confidence
+        self.current_apy = current_apy
 
 
 class BaseStrategy(ABC):

@@ -45,6 +45,12 @@ class ApprovalRequest:
         to_protocol: str,
         rationale: str,
         timeout_seconds: int = 3600,
+        gas_estimate_wei: Optional[int] = None,
+        gas_cost_usd: Optional[Decimal] = None,
+        price_impact: Optional[Decimal] = None,
+        slippage_bps: Optional[int] = None,
+        expected_output: Optional[str] = None,
+        min_output: Optional[str] = None,
     ) -> None:
         """Initialize an approval request.
 
@@ -56,6 +62,12 @@ class ApprovalRequest:
             to_protocol: Target protocol
             rationale: Explanation
             timeout_seconds: Approval timeout
+            gas_estimate_wei: Estimated gas in wei (optional)
+            gas_cost_usd: Estimated gas cost in USD (optional)
+            price_impact: Price impact percentage (optional, for swaps)
+            slippage_bps: Slippage tolerance in basis points (optional, for swaps)
+            expected_output: Expected output amount (optional, for swaps)
+            min_output: Minimum output amount (optional, for swaps)
         """
         self.request_id = request_id
         self.transaction_type = transaction_type
@@ -63,9 +75,82 @@ class ApprovalRequest:
         self.from_protocol = from_protocol
         self.to_protocol = to_protocol
         self.rationale = rationale
+        self.gas_estimate_wei = gas_estimate_wei
+        self.gas_cost_usd = gas_cost_usd or Decimal("0")
+        self.price_impact = price_impact
+        self.slippage_bps = slippage_bps
+        self.expected_output = expected_output
+        self.min_output = min_output
         self.status = ApprovalStatus.PENDING
         self.created_at = datetime.now()
         self.expires_at = self.created_at + timedelta(seconds=timeout_seconds)
+
+        # Event-driven status notification (non-blocking)
+        self._status_changed = asyncio.Event()
+
+    def _set_status(self, new_status: ApprovalStatus) -> None:
+        """Update status and notify waiters (event-driven pattern).
+
+        This method triggers the asyncio.Event, waking up any coroutines
+        waiting in wait_for_approval() without polling.
+
+        Args:
+            new_status: New approval status
+        """
+        self.status = new_status
+        self._status_changed.set()
+
+    def get_display_message(self) -> str:
+        """Get formatted approval request message for display.
+
+        Returns:
+            Formatted approval message with all relevant details
+        """
+        total_cost = self.amount_usd + self.gas_cost_usd
+
+        message = f"""
+╔══════════════════════════════════════════════════════════════
+║ 🔐 APPROVAL REQUIRED
+╠══════════════════════════════════════════════════════════════
+║ Request ID: {self.request_id}
+║ Type: {self.transaction_type}
+║ From: {self.from_protocol or 'Wallet'}
+║ To: {self.to_protocol}
+║
+║ Amount: ${self.amount_usd:,.2f}
+║ Gas Cost: ${self.gas_cost_usd:,.2f}"""
+
+        if self.gas_estimate_wei:
+            message += f"""
+║ Gas Estimate: {self.gas_estimate_wei:,} wei"""
+
+        # Add swap-specific fields if present
+        if self.expected_output and self.min_output:
+            message += f"""
+║
+║ Swap Details:
+║   Expected Output: {self.expected_output}
+║   Minimum Output: {self.min_output}"""
+
+        if self.slippage_bps is not None:
+            slippage_percent = self.slippage_bps / 100
+            message += f"""
+║   Slippage Tolerance: {slippage_percent:.2f}%"""
+
+        if self.price_impact is not None:
+            message += f"""
+║   Price Impact: {self.price_impact:.4f}%"""
+
+        message += f"""
+║ ─────────────────────────────────────────────────────────────
+║ TOTAL COST: ${total_cost:,.2f}
+║
+║ Rationale: {self.rationale}
+║
+║ Expires: {self.expires_at.strftime('%Y-%m-%d %H:%M:%S')}
+╚══════════════════════════════════════════════════════════════
+"""
+        return message
 
 
 class ApprovalManager:
@@ -95,16 +180,22 @@ class ApprovalManager:
         self.pending_requests: Dict[str, ApprovalRequest] = {}
         self.approval_callback = approval_callback
 
-    def requires_approval(self, amount_usd: Decimal) -> bool:
+    def requires_approval(
+        self,
+        amount_usd: Decimal,
+        gas_cost_usd: Optional[Decimal] = None,
+    ) -> bool:
         """Check if amount requires manual approval.
 
         Args:
             amount_usd: Transaction amount in USD
+            gas_cost_usd: Optional gas cost in USD (included in total)
 
         Returns:
             True if approval required
         """
-        return amount_usd >= self.approval_threshold_usd
+        total_cost = amount_usd + (gas_cost_usd or Decimal("0"))
+        return total_cost >= self.approval_threshold_usd
 
     async def request_approval(
         self,
@@ -114,6 +205,12 @@ class ApprovalManager:
         to_protocol: str,
         rationale: str,
         timeout_seconds: int = 3600,
+        gas_estimate_wei: Optional[int] = None,
+        gas_cost_usd: Optional[Decimal] = None,
+        price_impact: Optional[Decimal] = None,
+        slippage_bps: Optional[int] = None,
+        expected_output: Optional[str] = None,
+        min_output: Optional[str] = None,
     ) -> ApprovalRequest:
         """Create an approval request.
 
@@ -124,6 +221,12 @@ class ApprovalManager:
             to_protocol: Target protocol
             rationale: Explanation
             timeout_seconds: Request timeout in seconds (default: 1 hour)
+            gas_estimate_wei: Estimated gas in wei (optional)
+            gas_cost_usd: Estimated gas cost in USD (optional)
+            price_impact: Price impact percentage (optional, for swaps)
+            slippage_bps: Slippage tolerance in basis points (optional, for swaps)
+            expected_output: Expected output amount (optional, for swaps)
+            min_output: Minimum output amount (optional, for swaps)
 
         Returns:
             Approval request
@@ -140,6 +243,12 @@ class ApprovalManager:
             to_protocol=to_protocol,
             rationale=rationale,
             timeout_seconds=timeout_seconds,
+            gas_estimate_wei=gas_estimate_wei,
+            gas_cost_usd=gas_cost_usd,
+            price_impact=price_impact,
+            slippage_bps=slippage_bps,
+            expected_output=expected_output,
+            min_output=min_output,
         )
 
         # Store in pending requests
@@ -151,51 +260,46 @@ class ApprovalManager:
         self,
         request: ApprovalRequest,
         timeout_seconds: int = 3600,
-        poll_interval: float = 0.5,
     ) -> ApprovalStatus:
-        """Wait for user approval with timeout.
+        """Wait for user approval using event-driven pattern (non-blocking).
+
+        This method uses asyncio.Event instead of polling, providing instant
+        response when approval status changes without blocking the event loop.
+
+        Performance:
+        - Old (polling): Check every 0.5s = 7200 checks/hour
+        - New (event-driven): 1 event = instant response
 
         Args:
             request: Approval request
             timeout_seconds: Maximum wait time
-            poll_interval: How often to check status (seconds)
 
         Returns:
             Final approval status (APPROVED, REJECTED, or EXPIRED)
         """
-        start_time = datetime.now()
-        timeout = timedelta(seconds=timeout_seconds)
-
         # If callback is provided, call it immediately
         if self.approval_callback:
             try:
                 approved = self.approval_callback(request)
-                if approved:
-                    request.status = ApprovalStatus.APPROVED
-                    return ApprovalStatus.APPROVED
-                else:
-                    request.status = ApprovalStatus.REJECTED
-                    return ApprovalStatus.REJECTED
+                request._set_status(
+                    ApprovalStatus.APPROVED if approved else ApprovalStatus.REJECTED
+                )
+                return request.status
             except Exception:
-                # If callback fails, fall through to polling
+                # If callback fails, fall through to event waiting
                 pass
 
-        # Poll for approval status
-        while True:
-            # Check if request has been approved/rejected
-            if request.status == ApprovalStatus.APPROVED:
-                return ApprovalStatus.APPROVED
-            elif request.status == ApprovalStatus.REJECTED:
-                return ApprovalStatus.REJECTED
-
-            # Check if expired
-            elapsed = datetime.now() - start_time
-            if elapsed >= timeout or datetime.now() >= request.expires_at:
-                request.status = ApprovalStatus.EXPIRED
-                return ApprovalStatus.EXPIRED
-
-            # Wait before checking again
-            await asyncio.sleep(poll_interval)
+        # Wait for status change event (non-blocking)
+        try:
+            await asyncio.wait_for(
+                request._status_changed.wait(),
+                timeout=timeout_seconds
+            )
+            return request.status
+        except asyncio.TimeoutError:
+            # Timeout expired - mark request as expired
+            request._set_status(ApprovalStatus.EXPIRED)
+            return ApprovalStatus.EXPIRED
 
     def approve_request(self, request_id: str) -> bool:
         """Approve a pending request.
@@ -217,11 +321,11 @@ class ApprovalManager:
 
         # Check if expired
         if datetime.now() >= request.expires_at:
-            request.status = ApprovalStatus.EXPIRED
+            request._set_status(ApprovalStatus.EXPIRED)
             return False
 
-        # Approve the request
-        request.status = ApprovalStatus.APPROVED
+        # Approve the request (triggers event for wait_for_approval)
+        request._set_status(ApprovalStatus.APPROVED)
         return True
 
     def reject_request(self, request_id: str, reason: str = "") -> bool:
@@ -243,8 +347,8 @@ class ApprovalManager:
         if request.status != ApprovalStatus.PENDING:
             return False
 
-        # Reject the request
-        request.status = ApprovalStatus.REJECTED
+        # Reject the request (triggers event for wait_for_approval)
+        request._set_status(ApprovalStatus.REJECTED)
         return True
 
     def get_pending_requests(self) -> list[ApprovalRequest]:

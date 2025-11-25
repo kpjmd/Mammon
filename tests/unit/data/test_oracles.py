@@ -6,6 +6,7 @@ Tests the price oracle system added in Phase 1C Sprint 2.
 import pytest
 from decimal import Decimal
 from datetime import datetime, timedelta
+from unittest.mock import Mock, patch
 from src.data.oracles import (
     PriceOracle,
     MockPriceOracle,
@@ -194,37 +195,8 @@ class TestMockPriceOracleEdgeCases:
         assert price == large_price
 
 
-class TestChainlinkPriceOracle:
-    """Test ChainlinkPriceOracle stub."""
-
-    @pytest.fixture
-    def oracle(self):
-        """Create a ChainlinkPriceOracle instance."""
-        return ChainlinkPriceOracle(network="base-mainnet", rpc_url="https://test.rpc")
-
-    def test_initialization(self, oracle):
-        """Test oracle initialization."""
-        assert oracle.network == "base-mainnet"
-        assert oracle.rpc_url == "https://test.rpc"
-        assert isinstance(oracle.price_feeds, dict)
-        assert isinstance(oracle.cache, dict)
-
-    @pytest.mark.asyncio
-    async def test_get_price_not_implemented(self, oracle):
-        """Test that get_price raises NotImplementedError."""
-        with pytest.raises(NotImplementedError, match="ChainlinkPriceOracle not yet implemented"):
-            await oracle.get_price("ETH")
-
-    @pytest.mark.asyncio
-    async def test_get_prices_not_implemented(self, oracle):
-        """Test that get_prices raises NotImplementedError."""
-        with pytest.raises(NotImplementedError, match="ChainlinkPriceOracle not yet implemented"):
-            await oracle.get_prices(["ETH", "USDC"])
-
-    def test_is_price_stale_not_implemented(self, oracle):
-        """Test that is_price_stale raises NotImplementedError."""
-        with pytest.raises(NotImplementedError, match="ChainlinkPriceOracle not yet implemented"):
-            oracle.is_price_stale("ETH")
+# TestChainlinkPriceOracle class moved to test_chainlink_oracle.py (Phase 2A Sprint 2)
+# The comprehensive tests are now in a dedicated file with proper mocking
 
 
 class TestCreatePriceOracle:
@@ -240,22 +212,20 @@ class TestCreatePriceOracle:
         oracle = create_price_oracle()
         assert isinstance(oracle, MockPriceOracle)
 
-    def test_create_chainlink_oracle(self):
+    @patch("src.data.oracles.get_web3")
+    def test_create_chainlink_oracle(self, mock_get_web3):
         """Test creating Chainlink oracle."""
-        oracle = create_price_oracle("chainlink", network="base-mainnet", rpc_url="https://test.rpc")
+        mock_get_web3.return_value = Mock()
+        oracle = create_price_oracle("chainlink", network="base-mainnet")
         assert isinstance(oracle, ChainlinkPriceOracle)
-        assert oracle.network == "base-mainnet"
-        assert oracle.rpc_url == "https://test.rpc"
+        assert oracle.execution_network == "base-mainnet"
 
     def test_create_chainlink_oracle_missing_network(self):
         """Test creating Chainlink oracle without network fails."""
-        with pytest.raises(ValueError, match="ChainlinkPriceOracle requires 'network' and 'rpc_url'"):
-            create_price_oracle("chainlink", rpc_url="https://test.rpc")
+        with pytest.raises(ValueError, match="ChainlinkPriceOracle requires 'network' parameter"):
+            create_price_oracle("chainlink")
 
-    def test_create_chainlink_oracle_missing_rpc_url(self):
-        """Test creating Chainlink oracle without rpc_url fails."""
-        with pytest.raises(ValueError, match="ChainlinkPriceOracle requires 'network' and 'rpc_url'"):
-            create_price_oracle("chainlink", network="base-mainnet")
+    # test_create_chainlink_oracle_missing_rpc_url removed - rpc_url is now optional
 
     def test_create_unsupported_oracle_type(self):
         """Test creating unsupported oracle type fails."""
@@ -281,9 +251,11 @@ class TestPriceOracleInterface:
         oracle = MockPriceOracle()
         assert isinstance(oracle, PriceOracle)
 
-    def test_chainlink_oracle_implements_interface(self):
+    @patch("src.data.oracles.get_web3")
+    def test_chainlink_oracle_implements_interface(self, mock_get_web3):
         """Test that ChainlinkPriceOracle implements PriceOracle."""
-        oracle = ChainlinkPriceOracle(network="base-mainnet", rpc_url="https://test.rpc")
+        mock_get_web3.return_value = Mock()
+        oracle = ChainlinkPriceOracle(network="base-mainnet")
         assert isinstance(oracle, PriceOracle)
 
 

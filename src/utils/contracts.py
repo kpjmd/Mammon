@@ -147,6 +147,58 @@ UNISWAP_V3_POOL_ABI = [
     },
 ]
 
+# Uniswap V3 Universal Router ABI (minimal - for ETH->Token swaps)
+# Handles native ETH without WETH wrapping
+UNISWAP_V3_UNIVERSAL_ROUTER_ABI = [
+    {
+        "inputs": [
+            {"internalType": "bytes", "name": "commands", "type": "bytes"},
+            {"internalType": "bytes[]", "name": "inputs", "type": "bytes[]"},
+            {"internalType": "uint256", "name": "deadline", "type": "uint256"},
+        ],
+        "name": "execute",
+        "outputs": [],
+        "stateMutability": "payable",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"internalType": "bytes", "name": "commands", "type": "bytes"},
+            {"internalType": "bytes[]", "name": "inputs", "type": "bytes[]"},
+        ],
+        "name": "execute",
+        "outputs": [],
+        "stateMutability": "payable",
+        "type": "function",
+    },
+]
+
+# Uniswap V3 SwapRouter02 ABI (alternative to Universal Router)
+UNISWAP_V3_SWAP_ROUTER_ABI = [
+    {
+        "inputs": [
+            {
+                "components": [
+                    {"internalType": "address", "name": "tokenIn", "type": "address"},
+                    {"internalType": "address", "name": "tokenOut", "type": "address"},
+                    {"internalType": "uint24", "name": "fee", "type": "uint24"},
+                    {"internalType": "address", "name": "recipient", "type": "address"},
+                    {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
+                    {"internalType": "uint256", "name": "amountOutMinimum", "type": "uint256"},
+                    {"internalType": "uint160", "name": "sqrtPriceLimitX96", "type": "uint160"},
+                ],
+                "internalType": "struct ISwapRouter.ExactInputSingleParams",
+                "name": "params",
+                "type": "tuple",
+            }
+        ],
+        "name": "exactInputSingle",
+        "outputs": [{"internalType": "uint256", "name": "amountOut", "type": "uint256"}],
+        "stateMutability": "payable",
+        "type": "function",
+    },
+]
+
 
 class ContractHelper:
     """Helper class for contract interactions."""
@@ -224,6 +276,19 @@ COMMON_ADDRESSES = {
         "AERO": "0x940181a94A35A4569E4529a3CDfB74e38FD98631",  # AERO token
         "aerodrome_router": "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43",
         "aerodrome_factory": "0x420DD381b31aEf6683db6B902084cB0FFECe40Da",  # Verified ✅
+    },
+    # Base Sepolia (Testnet) - Sprint 4 Priority 3
+    "base-sepolia": {
+        # Tokens
+        "WETH": "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14",  # ✅ VERIFIED
+        "USDC": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",  # ✅ VERIFIED (Circle Official)
+
+        # Uniswap V3 (Official Deployments)
+        "uniswap_v3_universal_router": "0x5d08bB547e5A1B8C110d7967963A0e7914713E8D",  # ✅ VERIFIED
+        "uniswap_v3_factory": "0x33128a8fC17869897dcE68Ed026d694621f6FDfD",  # ✅ VERIFIED
+        "uniswap_v3_swap_router": "0x94cC0AaC535CCDB3C01d6787D6413C739ae12bc4",  # ✅ VERIFIED (SwapRouter02)
+
+        # Note: Universal Router handles native ETH, no WETH wrapping needed for ETH swaps
     },
     # Arbitrum Sepolia
     "arbitrum-sepolia": {

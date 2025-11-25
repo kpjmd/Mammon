@@ -9,8 +9,10 @@ from decimal import Decimal
 from src.utils.logger import get_logger
 from src.security.audit import AuditLogger, AuditEventType, AuditSeverity
 from src.utils.web3_provider import get_web3
+from src.utils.config import get_settings
 from src.utils.aerodrome_abis import AERODROME_FACTORY_ABI, AERODROME_POOL_ABI
 from src.utils.contracts import ERC20_ABI, ContractHelper, get_protocol_address
+from src.data.oracles import PriceOracle, create_price_oracle
 from .base import BaseProtocol, ProtocolPool
 
 logger = get_logger(__name__)
@@ -68,8 +70,60 @@ class AerodromeProtocol(BaseProtocol):
         self.dry_run_mode = config.get("dry_run_mode", True)
         self.audit_logger = AuditLogger()
 
+        # Initialize price oracle for TVL calculations
+        self._init_price_oracle(config)
+
+        # Performance optimization settings
+        self.max_pools = config.get("aerodrome_max_pools", 10)
+        supported_tokens_str = config.get("supported_tokens", "ETH,WETH,USDC,USDT,DAI,BTC,WBTC")
+        self.supported_tokens = set(token.strip().upper() for token in supported_tokens_str.split(","))
+
         if self.dry_run_mode:
             logger.info("🔒 AerodromeProtocol initialized in DRY RUN mode")
+        logger.info(
+            f"📊 AerodromeProtocol: max_pools={self.max_pools}, "
+            f"supported_tokens={len(self.supported_tokens)}"
+        )
+
+    def _init_price_oracle(self, config: Dict[str, Any]) -> None:
+        """Initialize price oracle for TVL calculations.
+
+        Uses Chainlink if enabled, otherwise falls back to mock oracle.
+
+        Args:
+            config: Configuration dict
+        """
+        # Check if shared price oracle provided in config
+        if "price_oracle" in config and config["price_oracle"] is not None:
+            self.price_oracle = config["price_oracle"]
+            logger.info("Using shared price oracle from config")
+            return
+
+        chainlink_enabled = config.get("chainlink_enabled", True)
+
+        if chainlink_enabled:
+            # Use Chainlink oracle with Base mainnet for price data
+            price_network = config.get("chainlink_price_network", "base-mainnet")
+            cache_ttl = config.get("chainlink_cache_ttl_seconds", 300)
+            max_staleness = config.get("chainlink_max_staleness_seconds", 3600)
+            fallback_to_mock = config.get("chainlink_fallback_to_mock", True)
+
+            logger.info(
+                f"Initializing Chainlink price oracle: "
+                f"price_network={price_network}, cache_ttl={cache_ttl}s"
+            )
+
+            self.price_oracle = create_price_oracle(
+                "chainlink",
+                network=self.network,
+                price_network=price_network,
+                cache_ttl_seconds=cache_ttl,
+                max_staleness_seconds=max_staleness,
+                fallback_to_mock=fallback_to_mock,
+            )
+        else:
+            logger.info("Using mock price oracle (Chainlink disabled)")
+            self.price_oracle = create_price_oracle("mock")
 
     async def get_pools(self) -> List[ProtocolPool]:
         """Fetch all available liquidity pools from Aerodrome.
@@ -342,19 +396,17 @@ class AerodromeProtocol(BaseProtocol):
         logger.warning(f"⚠️ LIVE MODE: Building real swap transaction")
         return tx
 
-    async def _get_real_pools_from_mainnet(self, max_pools: int = 5) -> List[ProtocolPool]:
+    async def _get_real_pools_from_mainnet(self) -> List[ProtocolPool]:
         """Query real Aerodrome pools from Base mainnet (read-only).
-
-        Args:
-            max_pools: Maximum number of pools to fetch (default: 5)
 
         Returns:
             List of real Aerodrome pools with actual on-chain data
         """
-        logger.info(f"📡 Fetching REAL Aerodrome pools from Base mainnet...")
+        logger.info(f"📡 Fetching top {self.max_pools} Aerodrome pools from Base mainnet...")
 
-        # Get Web3 instance for Base mainnet
-        w3 = get_web3("base-mainnet")
+        # Get Web3 instance for Base mainnet with premium RPC support
+        settings = get_settings()
+        w3 = get_web3("base-mainnet", config=settings)
 
         # Get factory contract
         factory_address = AERODROME_CONTRACTS["base-mainnet"]["factory"]
@@ -366,18 +418,26 @@ class AerodromeProtocol(BaseProtocol):
 
         # Fetch pool data
         pools = []
-        fetch_count = min(pool_count, max_pools)
+        fetch_count = min(pool_count, self.max_pools)
 
         for i in range(fetch_count):
             try:
                 # Get pool address
                 pool_address = factory.functions.allPools(i).call()
 
-                # Query pool data (synchronous Web3 calls)
-                pool_data = self._query_pool_data(w3, pool_address, factory)
+                # Query pool data (async due to price oracle)
+                pool_data = await self._query_pool_data(w3, pool_address, factory)
 
                 if pool_data:
-                    pools.append(pool_data)
+                    # Filter: Only include pools with supported tokens
+                    tokens = pool_data.tokens
+                    if any(token.upper() in self.supported_tokens for token in tokens):
+                        pools.append(pool_data)
+                    else:
+                        logger.debug(
+                            f"Skipping Aerodrome {'/'.join(tokens)} pool "
+                            f"(tokens not in supported list)"
+                        )
 
                 logger.debug(f"Fetched pool {i+1}/{fetch_count}: {pool_address}")
 
@@ -388,7 +448,7 @@ class AerodromeProtocol(BaseProtocol):
         logger.info(f"✅ Successfully fetched {len(pools)} real Aerodrome pools")
         return pools
 
-    def _query_pool_data(
+    async def _query_pool_data(
         self, w3: Any, pool_address: str, factory: Any
     ) -> Optional[ProtocolPool]:
         """Query data for a specific pool.
@@ -419,9 +479,10 @@ class AerodromeProtocol(BaseProtocol):
             except:
                 pool_name = f"{token0_symbol}/{token1_symbol} Pool"
 
-            # Calculate TVL (simplified - sum of reserves in USD)
-            # For accurate TVL we'd need token prices, using approximate for now
-            tvl = self._estimate_tvl(reserve0, reserve1, dec0, dec1)
+            # Calculate TVL using Chainlink price oracle
+            tvl, tvl_metadata = await self._estimate_tvl(
+                reserve0, reserve1, dec0, dec1, token0_symbol, token1_symbol
+            )
 
             # Get fee from factory
             fee = factory.functions.getFee(pool_address, is_stable).call()
@@ -432,29 +493,30 @@ class AerodromeProtocol(BaseProtocol):
             if is_stable:
                 pool_id += "-stable"
 
-            # Create ProtocolPool
+            # Create ProtocolPool with accurate TVL pricing metadata
+            pool_metadata = {
+                "pool_address": pool_address,
+                "token0": token0_addr,
+                "token1": token1_addr,
+                "reserve0": str(reserve0),
+                "reserve1": str(reserve1),
+                "decimals0": dec0,
+                "decimals1": dec1,
+                "is_stable": is_stable,
+                "fee_percent": str(fee_percent),
+                "source": "base_mainnet",
+            }
+
+            # Merge TVL pricing metadata
+            pool_metadata.update(tvl_metadata)
+
             return ProtocolPool(
                 pool_id=pool_id,
                 name=pool_name,
                 tokens=[token0_symbol, token1_symbol],
                 apy=Decimal("0"),  # APY calculation requires historical data
                 tvl=tvl,
-                metadata={
-                    "pool_address": pool_address,
-                    "token0": token0_addr,
-                    "token1": token1_addr,
-                    "reserve0": str(reserve0),
-                    "reserve1": str(reserve1),
-                    "decimals0": dec0,
-                    "decimals1": dec1,
-                    "is_stable": is_stable,
-                    "fee_percent": str(fee_percent),
-                    "source": "base_mainnet",
-                    # TVL metadata flags (Sprint 3 safeguards)
-                    "tvl_is_estimate": True,
-                    "tvl_method": "simplified_1dollar",
-                    "tvl_warning": "Do not use for calculations - Phase 2A will add real price oracle",
-                },
+                metadata=pool_metadata,
             )
 
         except Exception as e:
@@ -480,40 +542,96 @@ class AerodromeProtocol(BaseProtocol):
             # Return shortened address as fallback
             return f"{token_address[:6]}...{token_address[-4:]}"
 
-    def _estimate_tvl(
-        self, reserve0: int, reserve1: int, decimals0: int, decimals1: int
-    ) -> Decimal:
-        """Estimate pool TVL (simplified calculation).
+    async def _estimate_tvl(
+        self,
+        reserve0: int,
+        reserve1: int,
+        decimals0: int,
+        decimals1: int,
+        token0_symbol: str,
+        token1_symbol: str,
+    ) -> tuple[Decimal, Dict[str, Any]]:
+        """Calculate pool TVL using real price oracle data.
 
-        ⚠️ WARNING: This is a SIMPLIFIED calculation that assumes $1 per token.
-
-        This TVL estimate should ONLY be used for:
-        - Relative comparisons between pools (ranking)
-        - Display purposes in dashboards
-        - Filtering pools by approximate size
-
-        DO NOT use this TVL estimate for:
-        - Financial calculations or yield computations
-        - Risk assessments or position sizing
-        - Any production trading decisions
-
-        For accurate TVL, Phase 2A will integrate Chainlink price oracles to get
-        real-time token prices in USD.
+        Phase 2A Sprint 2: Now uses Chainlink price oracles for accurate pricing.
 
         Args:
             reserve0: Reserve of token0 (raw amount)
             reserve1: Reserve of token1 (raw amount)
             decimals0: Decimals of token0
             decimals1: Decimals of token1
+            token0_symbol: Symbol of token0 (e.g., "ETH", "USDC")
+            token1_symbol: Symbol of token1
 
         Returns:
-            Estimated TVL in USD (APPROXIMATE - see warnings above)
+            Tuple of (TVL in USD, metadata dict with pricing info)
+
+        Metadata includes:
+            - price0: Token0 price in USD
+            - price1: Token1 price in USD
+            - tvl_method: "chainlink_oracle" or "mock_oracle"
+            - price_source: Network prices were fetched from
         """
         # Convert reserves to human-readable amounts
         amount0 = Decimal(reserve0) / Decimal(10**decimals0)
         amount1 = Decimal(reserve1) / Decimal(10**decimals1)
 
-        # Simplified: assume $1 per token (we'll improve this in Phase 2A with price oracle)
-        tvl = amount0 + amount1
+        # Initialize metadata
+        metadata = {
+            "token0_amount": str(amount0),
+            "token1_amount": str(amount1),
+        }
 
-        return tvl
+        try:
+            # Get prices from oracle (async call)
+            prices = await self.price_oracle.get_prices([token0_symbol, token1_symbol])
+
+            if token0_symbol not in prices or token1_symbol not in prices:
+                # Partial price failure - try individual queries
+                logger.warning(
+                    f"Batch price query incomplete for {token0_symbol}/{token1_symbol}, "
+                    f"trying individual queries"
+                )
+                price0 = await self.price_oracle.get_price(token0_symbol)
+                price1 = await self.price_oracle.get_price(token1_symbol)
+            else:
+                price0 = prices[token0_symbol]
+                price1 = prices[token1_symbol]
+
+            # Calculate TVL using real prices
+            tvl = (amount0 * price0) + (amount1 * price1)
+
+            # Add pricing metadata
+            metadata.update({
+                "price0_usd": str(price0),
+                "price1_usd": str(price1),
+                "tvl_method": "chainlink_oracle" if hasattr(self.price_oracle, "price_network") else "mock_oracle",
+                "price_source": getattr(self.price_oracle, "price_network", "mock"),
+            })
+
+            logger.debug(
+                f"TVL calculation: {amount0:.2f} {token0_symbol} @ ${price0} + "
+                f"{amount1:.2f} {token1_symbol} @ ${price1} = ${tvl:.2f}"
+            )
+
+            return tvl, metadata
+
+        except Exception as e:
+            # If price fetching fails, log error and use fallback
+            logger.error(
+                f"Failed to fetch prices for {token0_symbol}/{token1_symbol}: {e}. "
+                f"Using $1 fallback estimate."
+            )
+
+            # Fallback to $1 per token estimate
+            tvl = amount0 + amount1
+
+            metadata.update({
+                "price0_usd": "1.00",
+                "price1_usd": "1.00",
+                "tvl_method": "fallback_estimate",
+                "tvl_error": str(e),
+                "tvl_warning": "Prices unavailable - using $1 per token estimate",
+            })
+
+            return tvl, metadata

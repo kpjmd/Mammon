@@ -467,7 +467,7 @@ class TestWaitForApproval:
             timeout_seconds=1,  # Very short timeout
         )
 
-        status = await manager.wait_for_approval(request, timeout_seconds=1, poll_interval=0.1)
+        status = await manager.wait_for_approval(request, timeout_seconds=1)
 
         assert status == ApprovalStatus.EXPIRED
         assert request.status == ApprovalStatus.EXPIRED
@@ -494,7 +494,7 @@ class TestWaitForApproval:
         approval_task = asyncio.create_task(approve_after_delay())
 
         # Wait for approval
-        status = await manager.wait_for_approval(request, timeout_seconds=5, poll_interval=0.1)
+        status = await manager.wait_for_approval(request, timeout_seconds=5)
 
         await approval_task
 
@@ -522,7 +522,7 @@ class TestWaitForApproval:
         rejection_task = asyncio.create_task(reject_after_delay())
 
         # Wait for result
-        status = await manager.wait_for_approval(request, timeout_seconds=5, poll_interval=0.1)
+        status = await manager.wait_for_approval(request, timeout_seconds=5)
 
         await rejection_task
 
@@ -661,6 +661,6 @@ class TestEdgeCases:
         )
 
         # Should fall back to polling and eventually timeout
-        status = await manager.wait_for_approval(request, timeout_seconds=1, poll_interval=0.1)
+        status = await manager.wait_for_approval(request, timeout_seconds=1)
 
         assert status == ApprovalStatus.EXPIRED
