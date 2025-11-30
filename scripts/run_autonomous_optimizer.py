@@ -63,7 +63,7 @@ class AutonomousRunner:
         scan_interval_hours: float = 2.0,
         max_rebalances_per_day: int = 6,
         max_gas_per_day_usd: Decimal = Decimal("10"),
-        dry_run: bool = False,
+        dry_run: Optional[bool] = None,
     ):
         """Initialize the autonomous runner.
 
@@ -72,15 +72,26 @@ class AutonomousRunner:
             scan_interval_hours: Hours between scans
             max_rebalances_per_day: Maximum rebalances allowed per day
             max_gas_per_day_usd: Maximum gas spend per day in USD
-            dry_run: If True, simulate transactions only
+            dry_run: If True, simulate transactions only. If None, read from .env DRY_RUN_MODE
         """
         self.duration_hours = duration_hours
         self.scan_interval_hours = scan_interval_hours
         self.max_rebalances_per_day = max_rebalances_per_day
         self.max_gas_per_day_usd = max_gas_per_day_usd
-        self.dry_run = dry_run
 
+        # Load settings first to get .env DRY_RUN_MODE
         self.settings = get_settings()
+
+        # If dry_run not explicitly set via CLI, read from .env
+        if dry_run is None:
+            self.dry_run = self.settings.dry_run_mode
+            logger.info(f"📋 DRY_RUN mode from .env: {self.dry_run}")
+        else:
+            self.dry_run = dry_run
+            if dry_run != self.settings.dry_run_mode:
+                logger.warning(
+                    f"⚠️  CLI dry_run={dry_run} OVERRIDES .env DRY_RUN_MODE={self.settings.dry_run_mode}"
+                )
         self.scheduler: Optional[ScheduledOptimizer] = None
         self.running = False
         self.start_time: Optional[datetime] = None
@@ -97,9 +108,11 @@ class AutonomousRunner:
 
     async def initialize(self) -> None:
         """Initialize all components for autonomous operation."""
+        logger.info("🚀 START: Autonomous optimizer initialization starting")
         print_header("MAMMON - Autonomous Optimizer Initialization")
 
         # Build config
+        logger.info("⚙️  STEP 1: Building configuration")
         config = {
             "network": self.settings.network,
             "wallet_seed": self.settings.wallet_seed,
@@ -113,10 +126,26 @@ class AutonomousRunner:
             "min_profit_usd": float(self.settings.min_profit_usd),
             "max_break_even_days": self.settings.max_break_even_days,
             "max_cost_pct": float(self.settings.max_cost_pct),
+            # Protocol scanning settings (Phase 4 Sprint 3)
+            "morpho_max_markets": self.settings.morpho_max_markets,
+            "aerodrome_max_pools": self.settings.aerodrome_max_pools,
+            "supported_tokens": self.settings.supported_tokens,
+            # BitQuery integration settings (Phase 4 Sprint 4)
+            "aerodrome_use_bitquery": self.settings.aerodrome_use_bitquery,
+            "bitquery_api_key": self.settings.bitquery_api_key,
+            "aerodrome_min_tvl_usd": self.settings.aerodrome_min_tvl_usd,
+            "aerodrome_min_volume_24h": self.settings.aerodrome_min_volume_24h,
+            "aerodrome_token_whitelist": self.settings.aerodrome_token_whitelist,
         }
+        logger.info("✅ STEP 1: Configuration built successfully")
 
         print(f"Network: {config['network']}")
-        print(f"Dry Run: {self.dry_run}")
+        if self.dry_run:
+            print(f"🔒 DRY RUN MODE: Transactions will be simulated only")
+        else:
+            print("=" * 70)
+            print("⚠️  LIVE MODE: REAL TRANSACTIONS WILL BE EXECUTED ON BLOCKCHAIN! ⚠️")
+            print("=" * 70)
         print(f"Duration: {self.duration_hours} hours")
         print(f"Scan Interval: {self.scan_interval_hours} hours")
         print(f"Max Rebalances/Day: {self.max_rebalances_per_day}")
@@ -126,36 +155,60 @@ class AutonomousRunner:
         print("\nInitializing components...")
 
         # Price oracle
-        oracle = create_price_oracle(
-            "chainlink" if config["chainlink_enabled"] else "mock",
-            network=config["network"],
-        )
+        logger.info("⚙️  STEP 2: Creating shared price oracle")
+        if config["chainlink_enabled"]:
+            oracle = create_price_oracle(
+                "chainlink",
+                network=config["network"],
+                price_network=getattr(self.settings, "chainlink_price_network", "base-mainnet"),
+                cache_ttl_seconds=getattr(self.settings, "chainlink_cache_ttl_seconds", 300),
+                max_staleness_seconds=getattr(self.settings, "chainlink_max_staleness_seconds", 3600),
+                fallback_to_mock=getattr(self.settings, "chainlink_fallback_to_mock", True),
+            )
+        else:
+            oracle = create_price_oracle("mock")
+        logger.info("✅ STEP 2: Price oracle created successfully")
         print("  ✅ Price oracle")
 
         # Wallet
+        logger.info("⚙️  STEP 3: Initializing wallet manager")
         wallet = WalletManager(config=config, price_oracle=oracle)
+        logger.info("⚙️  STEP 3a: Calling wallet.initialize()")
         await wallet.initialize()
+        logger.info(f"✅ STEP 3: Wallet initialized successfully: {wallet.address}")
         print(f"  ✅ Wallet: {wallet.address}")
 
         # Database
+        logger.info("⚙️  STEP 4: Initializing database")
         db_path = self.settings.database_url.replace("sqlite:///", "")
         database = Database(self.settings.database_url)
         database.create_all_tables()
+        logger.info("✅ STEP 4: Database initialized successfully")
         print("  ✅ Database")
 
         # Trackers - use db_path string
+        logger.info("⚙️  STEP 5: Creating position and performance trackers")
         position_tracker = PositionTracker(db_path)
         performance_tracker = PerformanceTracker(db_path)
+        logger.info("✅ STEP 5: Trackers created successfully")
         print("  ✅ Position & Performance Trackers")
 
-        # Agents
-        yield_scanner = YieldScannerAgent(config)
+        # Agents - CRITICAL: Pass shared oracle to avoid duplicate creation
+        logger.info("⚙️  STEP 6: Creating YieldScannerAgent with shared oracle")
+        # Modify config to pass shared oracle to avoid creating duplicate oracle in YieldScannerAgent
+        scanner_config = {**config, "price_oracle": oracle}
+        yield_scanner = YieldScannerAgent(scanner_config)
+        logger.info("✅ STEP 6: YieldScannerAgent created successfully")
+
+        logger.info("⚙️  STEP 7: Creating strategy and optimizer agents")
         strategy = SimpleYieldStrategy(config)
         optimizer = OptimizerAgent(config, yield_scanner, strategy)
         risk_assessor = RiskAssessorAgent(config)
+        logger.info("✅ STEP 7: Strategy and optimizer agents created successfully")
         print("  ✅ Yield Scanner, Optimizer, Risk Assessor")
 
         # Calculators and executors
+        logger.info("⚙️  STEP 8: Creating gas estimator and profitability calculator")
         gas_estimator = GasEstimator(config["network"], oracle)
         profitability_calc = ProfitabilityCalculator(
             min_annual_gain_usd=Decimal(str(config["min_profit_usd"])),
@@ -163,6 +216,9 @@ class AutonomousRunner:
             max_cost_pct=Decimal(str(config["max_cost_pct"])),
             gas_estimator=gas_estimator,
         )
+        logger.info("✅ STEP 8: Gas estimator and profitability calculator created successfully")
+
+        logger.info("⚙️  STEP 9: Creating protocol executor and rebalance executor")
         protocol_executor = ProtocolActionExecutor(wallet, config)
         rebalance_executor = RebalanceExecutor(
             wallet_manager=wallet,
@@ -172,9 +228,11 @@ class AutonomousRunner:
             config=config,
         )
         audit_logger = AuditLogger()
+        logger.info("✅ STEP 9: Executors created successfully")
         print("  ✅ Profitability Calculator, Rebalance Executor")
 
         # Create scheduled optimizer
+        logger.info("⚙️  STEP 10: Creating scheduled optimizer")
         self.scheduler = ScheduledOptimizer(
             config=config,
             yield_scanner=yield_scanner,
@@ -187,6 +245,7 @@ class AutonomousRunner:
             database=database,
             position_tracker=position_tracker,
         )
+        logger.info("✅ STEP 10: Scheduled optimizer created successfully")
         print("  ✅ Scheduled Optimizer")
 
         # Store references for metrics
@@ -223,8 +282,21 @@ class AutonomousRunner:
             else:
                 initial_balance = Decimal(str(eth_balance))
             eth_price = await self.oracle.get_price("ETH")
-            initial_value_usd = initial_balance * eth_price
-            print(f"Initial ETH Balance: {initial_balance:.6f} ETH (${initial_value_usd:.2f})")
+            eth_value_usd = initial_balance * eth_price
+
+            # Get DeFi positions from database
+            positions = await self.position_tracker.get_current_positions()
+            positions_value_usd = sum(p.value_usd for p in positions)
+
+            # Total portfolio = ETH + DeFi positions
+            initial_value_usd = eth_value_usd + positions_value_usd
+
+            print(f"Initial Portfolio: ${initial_value_usd:.2f}")
+            print(f"  ETH: {initial_balance:.6f} ETH (${eth_value_usd:.2f})")
+            if positions_value_usd > 0:
+                print(f"  DeFi Positions: ${positions_value_usd:.2f}")
+                for pos in positions:
+                    print(f"    {pos.protocol} {pos.pool_id}: ${pos.value_usd:.2f}")
         except Exception as e:
             initial_value_usd = Decimal("0")
             print(f"Could not fetch balance: {e}")
@@ -254,16 +326,55 @@ class AutonomousRunner:
 
                 # Sleep until next scan
                 next_scan = datetime.now(UTC) + timedelta(hours=self.scan_interval_hours)
-                if next_scan < self.end_time:
-                    sleep_seconds = self.scan_interval_hours * 3600
-                    print(f"\nNext scan at {next_scan.strftime('%H:%M:%S UTC')}")
-                    print(f"Sleeping for {self.scan_interval_hours} hours...")
 
-                    # Sleep in short intervals to allow for interruption
-                    for _ in range(int(sleep_seconds / 10)):
-                        if not self.running:
-                            break
-                        await asyncio.sleep(10)
+                # BUG FIX #2: Exit gracefully if next scan would exceed end time
+                if next_scan >= self.end_time:
+                    logger.info(f"Next scan at {next_scan} would exceed end time {self.end_time}, exiting")
+                    print(f"\n✅ Next scan would exceed end time, completing run")
+                    break
+
+                # Sleep until next scan with debug logging for BUG #1 investigation
+                sleep_seconds = self.scan_interval_hours * 3600
+                sleep_iterations = int(sleep_seconds / 10)
+                print(f"\nNext scan at {next_scan.strftime('%H:%M:%S UTC')}")
+                print(f"Sleeping for {self.scan_interval_hours} hours ({sleep_iterations} × 10s iterations)...")
+
+                # Track sleep timing to detect anomalies
+                sleep_start = datetime.now(UTC)
+                iterations_completed = 0
+
+                # Sleep in short intervals to allow for interruption
+                for i in range(sleep_iterations):
+                    if not self.running:
+                        break
+
+                    # Time each iteration to detect blocking
+                    iter_start = datetime.now(UTC)
+                    await asyncio.sleep(10)
+                    iter_duration = (datetime.now(UTC) - iter_start).total_seconds()
+                    iterations_completed += 1
+
+                    # Warn if single iteration took >30s (should be ~10s)
+                    if iter_duration > 30:
+                        logger.warning(f"⚠️  Sleep iteration {i} took {iter_duration:.1f}s (expected 10s)")
+
+                    # Log every 60 iterations (10 min) as heartbeat
+                    if iterations_completed % 60 == 0:
+                        elapsed = (datetime.now(UTC) - sleep_start).total_seconds()
+                        logger.info(f"💤 Sleep heartbeat: {iterations_completed}/{sleep_iterations} iterations, {elapsed:.0f}s elapsed")
+                        print(f"  💤 Sleep heartbeat: {iterations_completed}/{sleep_iterations} iterations ({elapsed:.0f}s elapsed)")
+
+                # Check for sleep anomalies
+                sleep_end = datetime.now(UTC)
+                actual_sleep = (sleep_end - sleep_start).total_seconds()
+                expected_sleep = sleep_seconds
+
+                if abs(actual_sleep - expected_sleep) > 60:  # More than 1 min variance
+                    logger.warning(
+                        f"⚠️  SLEEP ANOMALY: Expected {expected_sleep}s, actual {actual_sleep}s "
+                        f"(diff: {actual_sleep - expected_sleep:.0f}s)"
+                    )
+                    print(f"  ⚠️  Sleep anomaly detected: expected {expected_sleep:.0f}s, actual {actual_sleep:.0f}s")
 
         except Exception as e:
             logger.error(f"Error during autonomous operation: {e}")
@@ -388,8 +499,28 @@ class AutonomousRunner:
         end_time = datetime.now(UTC)
         duration = end_time - self.start_time
 
-        # Get final balance - simplified
-        final_balance = initial_balance  # Same for now (would need price updates)
+        # Get final balance - ETH + DeFi positions
+        try:
+            # Get final ETH balance
+            final_eth_balance = await self.wallet.get_balance()
+            if isinstance(final_eth_balance, Decimal):
+                final_eth = final_eth_balance
+            else:
+                final_eth = Decimal(str(final_eth_balance))
+            eth_price = await self.oracle.get_price("ETH")
+            final_eth_value = final_eth * eth_price
+
+            # Get final position values (may have changed due to rebalances)
+            final_positions = await self.position_tracker.get_current_positions()
+            final_positions_value = sum(p.value_usd for p in final_positions)
+
+            # Total final portfolio value
+            final_balance = final_eth_value + final_positions_value
+        except Exception as e:
+            logger.warning(f"Could not fetch final balance: {e}")
+            final_balance = initial_balance  # Fallback to initial
+
+        # Calculate P&L
         pnl = final_balance - initial_balance
         pnl_percent = (pnl / initial_balance * 100) if initial_balance > 0 else Decimal("0")
 
@@ -429,8 +560,24 @@ class AutonomousRunner:
         print(f"  Executed: {self.opportunities_executed}")
         print(f"  Skipped: {self.opportunities_skipped}")
         print(f"\nFinancials:")
-        print(f"  Initial Balance: ${initial_balance:.2f}")
-        print(f"  Final Balance: ${final_balance:.2f}")
+        print(f"  Initial Portfolio: ${initial_balance:.2f}")
+        print(f"  Final Portfolio: ${final_balance:.2f}")
+
+        # Show breakdown if we have positions
+        try:
+            final_eth_detail = await self.wallet.get_balance()
+            final_eth_val = final_eth_detail * await self.oracle.get_price("ETH") if isinstance(final_eth_detail, Decimal) else Decimal(str(final_eth_detail)) * await self.oracle.get_price("ETH")
+            final_pos = await self.position_tracker.get_current_positions()
+            final_pos_val = sum(p.value_usd for p in final_pos)
+
+            print(f"    ETH: ${final_eth_val:.2f}")
+            if final_pos_val > 0:
+                print(f"    DeFi Positions: ${final_pos_val:.2f}")
+                for pos in final_pos:
+                    print(f"      {pos.protocol} {pos.pool_id}: ${pos.value_usd:.2f}")
+        except Exception:
+            pass  # Skip breakdown if can't fetch
+
         print(f"  P&L: ${pnl:.2f} ({pnl_percent:.2f}%)")
         print(f"  Gas Spent: ${self.total_gas_spent_usd:.4f}")
         print(f"\nErrors: {len(self.errors)}")
@@ -494,10 +641,14 @@ async def main():
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Simulate transactions only"
+        default=None,
+        help="Enable dry-run mode (simulates transactions). If not specified, reads from .env DRY_RUN_MODE"
     )
 
     args = parser.parse_args()
+
+    # Handle --dry-run flag: only pass True if explicitly set, otherwise None (read from .env)
+    dry_run_arg = True if args.dry_run else None
 
     # Create runner
     runner = AutonomousRunner(
@@ -505,7 +656,7 @@ async def main():
         scan_interval_hours=args.interval,
         max_rebalances_per_day=args.max_rebalances,
         max_gas_per_day_usd=Decimal(str(args.max_gas)),
-        dry_run=args.dry_run,
+        dry_run=dry_run_arg,
     )
 
     # Setup signal handler for graceful shutdown
@@ -517,7 +668,22 @@ async def main():
 
     # Initialize and run
     try:
-        await runner.initialize()
+        # Add timeout to initialization to prevent hanging
+        # This protects against blocking RPC calls or other synchronous operations
+        logger.info("Starting initialization with 5-minute timeout protection")
+        try:
+            await asyncio.wait_for(
+                runner.initialize(),
+                timeout=300  # 5 minutes max for initialization
+            )
+            logger.info("✅ Initialization completed successfully within timeout")
+        except asyncio.TimeoutError:
+            logger.error("❌ FATAL: Initialization timed out after 5 minutes!")
+            print("\n❌ FATAL ERROR: Initialization timed out after 5 minutes")
+            print("   This indicates a blocking operation (likely RPC connection)")
+            print("   Check logs for the last completed step")
+            sys.exit(1)
+
         summary = await runner.run()
 
         # Exit with success or failure based on errors
