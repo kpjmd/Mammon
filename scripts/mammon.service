@@ -1,0 +1,29 @@
+[Unit]
+Description=MAMMON Autonomous Yield Optimizer
+Documentation=https://github.com/kpjmd/Mammon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/mammon
+Environment="PYTHONUNBUFFERED=1"
+Environment="PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/root/.local/bin/poetry run python -u scripts/run_autonomous_optimizer.py --duration 48 --interval 2
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mammon
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target
