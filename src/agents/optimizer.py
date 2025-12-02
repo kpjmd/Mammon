@@ -116,7 +116,7 @@ class OptimizerAgent:
 
         # Handle empty opportunities
         if not opportunities:
-            logger.warning("No yield opportunities found")
+            logger.warning("⚠️  OPTIMIZER: No yield opportunities found")
             await self.audit_logger.log_event(
                 AuditEventType.YIELD_SCAN,
                 AuditSeverity.WARNING,
@@ -126,23 +126,26 @@ class OptimizerAgent:
             return []
 
         # Step 2: Convert YieldOpportunity objects to Dict[protocol, apy]
+        logger.info("🔍 OPTIMIZER STEP 3: Building yields dictionary...")
         available_yields = self._build_yields_dictionary(opportunities)
         logger.info(
-            f"Built yields dictionary with {len(available_yields)} protocols"
+            f"✅ OPTIMIZER STEP 3: Built yields dictionary with {len(available_yields)} protocols"
         )
 
         # Handle empty positions
         if not current_positions:
-            logger.info("No current positions to rebalance")
+            logger.info("⚠️  OPTIMIZER: No current positions to rebalance")
             return []
 
         # Step 3: Call strategy to analyze opportunities
+        logger.info("🔍 OPTIMIZER STEP 4: Analyzing opportunities with strategy...")
+        logger.info(f"🔍 OPTIMIZER STEP 4a: Calling strategy.analyze_opportunities()")
         try:
             recommendations = await self.strategy.analyze_opportunities(
                 current_positions=current_positions,
                 available_yields=available_yields,
             )
-            logger.info(f"Strategy generated {len(recommendations)} recommendations")
+            logger.info(f"✅ OPTIMIZER STEP 4: Strategy generated {len(recommendations)} recommendations")
         except Exception as e:
             logger.error(f"Strategy analysis failed: {e}")
             await self.audit_logger.log_event(
@@ -154,9 +157,12 @@ class OptimizerAgent:
             return []
 
         # Step 4: Audit log all recommendations
+        logger.info("🔍 OPTIMIZER STEP 5: Logging recommendations...")
         await self._log_recommendations(recommendations, current_positions)
+        logger.info("✅ OPTIMIZER STEP 5: Recommendations logged")
 
         # Step 5: Sort by confidence and return
+        logger.info("🔍 OPTIMIZER STEP 6: Sorting recommendations by confidence...")
         sorted_recommendations = sorted(
             recommendations,
             key=lambda r: r.confidence,
@@ -164,7 +170,7 @@ class OptimizerAgent:
         )
 
         logger.info(
-            f"✅ Optimization complete: {len(sorted_recommendations)} recommendations"
+            f"✅ OPTIMIZER STEP 6: Optimization complete: {len(sorted_recommendations)} recommendations"
         )
         return sorted_recommendations
 

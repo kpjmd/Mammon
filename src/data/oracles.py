@@ -280,7 +280,8 @@ class ChainlinkPriceOracle(PriceOracle):
         if canonical_symbol in self.missing_feeds_cache:
             # Skip the warning log since we already know it's missing
             if self.fallback_oracle:
-                return await self.fallback_oracle.get_price(token, quote)
+                fallback_price = await self.fallback_oracle.get_price(token, quote)
+                return fallback_price
             raise ValueError(
                 f"No Chainlink price feed for {token}/{quote} on {self.price_network} "
                 f"(cached as missing)"
@@ -302,7 +303,8 @@ class ChainlinkPriceOracle(PriceOracle):
             # Try fallback oracle
             if self.fallback_oracle:
                 logger.info(f"Using fallback oracle for {token_upper}")
-                return await self.fallback_oracle.get_price(token, quote)
+                fallback_price = await self.fallback_oracle.get_price(token, quote)
+                return fallback_price
 
             raise ValueError(
                 f"No Chainlink price feed for {token}/{quote} on {self.price_network} "
@@ -458,8 +460,8 @@ class ChainlinkPriceOracle(PriceOracle):
                     abi=AGGREGATOR_V3_ABI,
                 )
 
-                # Query latest round data
-                round_data = feed_contract.functions.latestRoundData().call()
+                # Query latest round data (wrap blocking call in thread pool)
+                round_data = await asyncio.to_thread(feed_contract.functions.latestRoundData().call)
                 round_id, answer, started_at, updated_at, answered_in_round = round_data
 
                 # Validate round data
@@ -469,8 +471,8 @@ class ChainlinkPriceOracle(PriceOracle):
                 if updated_at == 0:
                     raise ValueError("Invalid timestamp from Chainlink")
 
-                # Get feed decimals
-                decimals = feed_contract.functions.decimals().call()
+                # Get feed decimals (wrap blocking call in thread pool)
+                decimals = await asyncio.to_thread(feed_contract.functions.decimals().call)
 
                 # Convert to Decimal (Chainlink typically uses 8 decimals)
                 price = Decimal(answer) / Decimal(10 ** decimals)

@@ -33,7 +33,12 @@ class Database:
             database_url: Database connection URL
         """
         self.database_url = database_url
-        self.engine = create_engine(database_url)
+        # Add timeout to prevent hanging on database locks (SQLite specific)
+        connect_args = {}
+        if database_url.startswith("sqlite:"):
+            connect_args = {"timeout": 10}  # 10 second timeout for SQLite
+
+        self.engine = create_engine(database_url, connect_args=connect_args)
         self.session_factory = sessionmaker(bind=self.engine, expire_on_commit=False)
 
     def create_all_tables(self) -> None:

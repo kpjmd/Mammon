@@ -36,6 +36,7 @@ class RebalanceStep(Enum):
     VALIDATION = "validation"
     BALANCE_CHECK = "balance_check"
     WITHDRAW = "withdraw"
+    APPROVE = "approve"  # Generic approval step
     APPROVE_SWAP = "approve_swap"
     SWAP = "swap"
     APPROVE_DEPOSIT = "approve_deposit"
@@ -206,6 +207,74 @@ class RebalanceExecutor:
 
             # Step 2: Check initial balances
             await self._check_initial_balances(recommendation, execution)
+
+            # DRY RUN MODE: Simulate all remaining steps without real transactions
+            if self.dry_run_mode:
+                logger.info("🔒 DRY RUN MODE: Simulating transaction steps (no real execution)")
+
+                # Simulate withdraw step
+                if recommendation.from_protocol:
+                    execution.add_step_result(
+                        StepResult(
+                            step=RebalanceStep.WITHDRAW,
+                            success=True,
+                            tx_hash="0x_DRY_RUN_SIMULATED_WITHDRAW",
+                            gas_used=150000,  # Typical withdraw gas
+                        )
+                    )
+                    logger.info(f"🔒 [DRY RUN] Simulated withdraw from {recommendation.from_protocol}")
+
+                # Simulate approval step
+                execution.add_step_result(
+                    StepResult(
+                        step=RebalanceStep.APPROVE,
+                        success=True,
+                        tx_hash="0x_DRY_RUN_SIMULATED_APPROVE",
+                        gas_used=46000,  # Typical approve gas
+                    )
+                )
+                logger.info(f"🔒 [DRY RUN] Simulated approval for {recommendation.to_protocol}")
+
+                # Simulate deposit step
+                execution.add_step_result(
+                    StepResult(
+                        step=RebalanceStep.DEPOSIT,
+                        success=True,
+                        tx_hash="0x_DRY_RUN_SIMULATED_DEPOSIT",
+                        gas_used=200000,  # Typical deposit gas
+                    )
+                )
+                logger.info(f"🔒 [DRY RUN] Simulated deposit to {recommendation.to_protocol}")
+
+                # Calculate simulated costs
+                execution.total_gas_used = sum(s.gas_used or 0 for s in execution.steps)
+                execution.total_gas_cost_usd = Decimal("0.50")  # Estimated cost
+
+                # Mark as successful
+                execution.success = True
+                execution.completed_at = datetime.now()
+
+                await self.audit_logger.log_event(
+                    AuditEventType.REBALANCE_EXECUTED,
+                    AuditSeverity.INFO,
+                    f"🔒 DRY RUN: Rebalance simulation completed successfully",
+                    metadata={
+                        "dry_run": True,
+                        "from_protocol": recommendation.from_protocol,
+                        "to_protocol": recommendation.to_protocol,
+                        "token": recommendation.token,
+                        "amount": str(recommendation.amount),
+                        "simulated_gas_used": execution.total_gas_used,
+                    },
+                )
+
+                logger.info(
+                    f"🔒 DRY RUN: Rebalance simulation completed! "
+                    f"Would have moved {recommendation.amount} {recommendation.token} "
+                    f"from {recommendation.from_protocol} → {recommendation.to_protocol}"
+                )
+
+                return execution
 
             # Step 3: Withdraw from source (if rebalancing existing position)
             if recommendation.from_protocol:

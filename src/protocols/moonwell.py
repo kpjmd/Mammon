@@ -85,6 +85,27 @@ MTOKEN_ABI = [
         "stateMutability": "view",
         "type": "function",
     },
+    {
+        "inputs": [{"internalType": "address", "name": "owner", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [{"internalType": "address", "name": "owner", "type": "address"}],
+        "name": "balanceOfUnderlying",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "inputs": [],
+        "name": "exchangeRateStored",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
 ]
 
 # ERC20 ABI for getting token symbols and decimals
@@ -228,6 +249,8 @@ class MoonwellProtocol(BaseProtocol):
         Returns:
             List of Moonwell lending markets
         """
+        logger.info(f"📡 [MOONWELL] Fetching pools from Base mainnet...")
+
         # Log pool query
         await self.audit_logger.log_event(
             AuditEventType.POOL_QUERY,
@@ -243,12 +266,14 @@ class MoonwellProtocol(BaseProtocol):
         try:
             # Get list of all mToken markets from Comptroller
             mtoken_addresses = self.comptroller_contract.functions.getAllMarkets().call()
-            logger.info(f"Found {len(mtoken_addresses)} Moonwell markets on Base mainnet")
+            logger.info(f"[MOONWELL] Found {len(mtoken_addresses)} markets on Base mainnet")
 
             pools = []
 
             for mtoken_address in mtoken_addresses:
                 try:
+                    logger.info(f"[MOONWELL] Processing market: {mtoken_address}")
+
                     # Create mToken contract instance
                     mtoken_contract = self.web3.eth.contract(
                         address=mtoken_address,
@@ -272,6 +297,8 @@ class MoonwellProtocol(BaseProtocol):
                         decimals = 18
                         underlying_address = "0x0000000000000000000000000000000000000000"
 
+                    logger.info(f"[MOONWELL] Token identified: {token_symbol} (decimals={decimals})")
+
                     # Get market data (using timestamp-based rates on Base)
                     supply_rate = mtoken_contract.functions.supplyRatePerTimestamp().call()
                     borrow_rate = mtoken_contract.functions.borrowRatePerTimestamp().call()
@@ -285,9 +312,25 @@ class MoonwellProtocol(BaseProtocol):
 
                     # Calculate TVL in tokens
                     tvl_tokens = Decimal(cash + total_borrows - total_reserves) / Decimal(10**decimals)
+                    logger.info(f"[MOONWELL] {token_symbol} TVL: {tvl_tokens} tokens")
 
-                    # Get USD price for TVL
-                    token_price_usd = await self.price_oracle.get_price(token_symbol)
+                    # Get USD price for TVL with fallback
+                    try:
+                        token_price_usd = await self.price_oracle.get_price(token_symbol)
+                        logger.info(f"[MOONWELL] {token_symbol} price from oracle: ${token_price_usd}")
+                    except Exception as e:
+                        logger.warning(
+                            f"[MOONWELL] Price oracle failed for {token_symbol}: {e}, using $1 fallback"
+                        )
+                        # Fallback to $1 for stablecoins, skip others
+                        stablecoins = ["USDC", "USDT", "DAI", "USDBC", "USDbC"]
+                        if token_symbol.upper() in stablecoins:
+                            token_price_usd = Decimal("1")
+                        else:
+                            # Skip non-stablecoins without prices
+                            logger.warning(f"[MOONWELL] Skipping {token_symbol} (no price available)")
+                            continue
+
                     tvl_usd = tvl_tokens * token_price_usd
 
                     # Calculate utilization
@@ -317,8 +360,8 @@ class MoonwellProtocol(BaseProtocol):
 
                     pools.append(pool)
                     logger.info(
-                        f"Moonwell {token_symbol}: {supply_apy:.2f}% APY, "
-                        f"${tvl_usd:,.0f} TVL"
+                        f"✅ [MOONWELL] {token_symbol}: {supply_apy:.2f}% APY, "
+                        f"${tvl_usd:,.0f} TVL, pool added successfully"
                     )
 
                 except Exception as e:
@@ -476,11 +519,11 @@ class MoonwellProtocol(BaseProtocol):
         """Get user's supplied balance in a Moonwell market.
 
         Args:
-            pool_id: Market identifier
+            pool_id: Market identifier (e.g., 'moonwell-usdc')
             user_address: User's wallet address
 
         Returns:
-            User's supplied balance in the market
+            User's supplied balance in the market (underlying tokens)
         """
         # Log balance query
         await self.audit_logger.log_event(
@@ -494,9 +537,76 @@ class MoonwellProtocol(BaseProtocol):
             },
         )
 
-        # TODO: Query user's mToken balance from Base mainnet
-        logger.info(f"Balance query for {user_address} in {pool_id}")
-        return Decimal("0")  # No positions yet in development
+        try:
+            # Ensure address is checksummed
+            from web3 import Web3
+            user_address = Web3.to_checksum_address(user_address)
+
+            # Extract token symbol from pool_id (e.g., 'moonwell-usdc' -> 'USDC')
+            token_symbol = pool_id.replace("moonwell-", "").upper()
+
+            # Get list of all mToken markets from Comptroller
+            mtoken_addresses = self.comptroller_contract.functions.getAllMarkets().call()
+
+            for mtoken_address in mtoken_addresses:
+                try:
+                    # Create mToken contract instance
+                    mtoken_contract = self.web3.eth.contract(
+                        address=mtoken_address,
+                        abi=MTOKEN_ABI,
+                    )
+
+                    # Get underlying asset info
+                    try:
+                        underlying_address = mtoken_contract.functions.underlying().call()
+
+                        # Get underlying token symbol
+                        token_contract = self.web3.eth.contract(
+                            address=underlying_address,
+                            abi=ERC20_ABI,
+                        )
+                        symbol = token_contract.functions.symbol().call()
+                        decimals = token_contract.functions.decimals().call()
+                    except Exception:
+                        # Native ETH market (no underlying() function)
+                        symbol = "ETH"
+                        decimals = 18
+
+                    # Check if this is the market we're looking for
+                    if symbol.upper() == token_symbol:
+                        # Query user's mToken balance (fast view function)
+                        mtoken_balance = mtoken_contract.functions.balanceOf(user_address).call()
+
+                        # Early exit if no balance
+                        if mtoken_balance == 0:
+                            return Decimal("0")
+
+                        # Get exchange rate (mToken to underlying, scaled by 1e18)
+                        exchange_rate = mtoken_contract.functions.exchangeRateStored().call()
+
+                        # Calculate underlying balance: (mToken_balance * exchangeRate) / 1e18
+                        # Both mtoken_balance and exchange_rate are in wei, so we need to account for decimals
+                        underlying_balance_wei = (mtoken_balance * exchange_rate) // (10**18)
+
+                        # Convert to human-readable amount
+                        balance = Decimal(underlying_balance_wei) / Decimal(10**decimals)
+
+                        logger.info(
+                            f"User {user_address[:8]}... has {balance} {token_symbol} in Moonwell"
+                        )
+                        return balance
+
+                except Exception as e:
+                    logger.warning(f"Error checking mToken {mtoken_address}: {e}")
+                    continue
+
+            # Token not found in Moonwell markets
+            logger.warning(f"Token {token_symbol} not found in Moonwell markets")
+            return Decimal("0")
+
+        except Exception as e:
+            logger.error(f"Failed to get user balance for {pool_id}: {e}")
+            return Decimal("0")
 
     async def estimate_gas(self, operation: str, params: Dict[str, Any]) -> int:
         """Estimate gas for Moonwell operations.

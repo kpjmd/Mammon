@@ -6,6 +6,7 @@ https://aerodrome.finance/
 
 from typing import Any, Dict, List, Optional
 from decimal import Decimal
+import asyncio
 from src.utils.logger import get_logger
 from src.security.audit import AuditLogger, AuditEventType, AuditSeverity
 from src.utils.web3_provider import get_web3
@@ -13,6 +14,7 @@ from src.utils.config import get_settings
 from src.utils.aerodrome_abis import AERODROME_FACTORY_ABI, AERODROME_POOL_ABI
 from src.utils.contracts import ERC20_ABI, ContractHelper, get_protocol_address
 from src.data.oracles import PriceOracle, create_price_oracle
+from src.api.aerodrome_bitquery import create_bitquery_client
 from .base import BaseProtocol, ProtocolPool
 
 logger = get_logger(__name__)
@@ -78,11 +80,22 @@ class AerodromeProtocol(BaseProtocol):
         supported_tokens_str = config.get("supported_tokens", "ETH,WETH,USDC,USDT,DAI,BTC,WBTC")
         self.supported_tokens = set(token.strip().upper() for token in supported_tokens_str.split(","))
 
+        # BitQuery integration settings
+        self.use_bitquery = config.get("aerodrome_use_bitquery", True)
+        self.bitquery_api_key = config.get("bitquery_api_key")
+        self.aerodrome_min_tvl_usd = Decimal(str(config.get("aerodrome_min_tvl_usd", "10000")))
+        self.aerodrome_min_volume_24h = Decimal(str(config.get("aerodrome_min_volume_24h", "100")))
+        self.aerodrome_token_whitelist = set(
+            token.strip().upper()
+            for token in config.get("aerodrome_token_whitelist", "USDC,WETH,USDT,DAI,WBTC,AERO").split(",")
+        )
+
         if self.dry_run_mode:
             logger.info("🔒 AerodromeProtocol initialized in DRY RUN mode")
         logger.info(
             f"📊 AerodromeProtocol: max_pools={self.max_pools}, "
-            f"supported_tokens={len(self.supported_tokens)}"
+            f"supported_tokens={len(self.supported_tokens)}, "
+            f"use_bitquery={self.use_bitquery}"
         )
 
     def _init_price_oracle(self, config: Dict[str, Any]) -> None:
@@ -141,8 +154,10 @@ class AerodromeProtocol(BaseProtocol):
             {"protocol": "Aerodrome", "network": self.network, "action": "get_pools"},
         )
 
-        # If Base mainnet and not dry-run, fetch REAL data
-        if self.network == "base-mainnet" and not self.dry_run_mode:
+        # If Base mainnet, fetch REAL data (dry_run only affects transactions, not data)
+        # Note: dry_run_mode controls transaction execution in RebalanceExecutor,
+        # not data fetching. We want real pool data even when testing.
+        if self.network == "base-mainnet":
             try:
                 return await self._get_real_pools_from_mainnet()
             except Exception as e:
@@ -399,12 +414,153 @@ class AerodromeProtocol(BaseProtocol):
     async def _get_real_pools_from_mainnet(self) -> List[ProtocolPool]:
         """Query real Aerodrome pools from Base mainnet (read-only).
 
+        Uses hybrid approach:
+        1. BitQuery API to get filtered pool list (if enabled)
+        2. On-chain validation for real-time data
+        3. Falls back to factory queries if BitQuery fails
+
         Returns:
             List of real Aerodrome pools with actual on-chain data
         """
-        logger.info(f"📡 Fetching top {self.max_pools} Aerodrome pools from Base mainnet...")
+        logger.info(f"📡 Fetching Aerodrome pools from Base mainnet...")
+        print(f"📡 [AERODROME] Fetching pools from Base mainnet...", flush=True)
 
-        # Get Web3 instance for Base mainnet with premium RPC support
+        # Debug: Log BitQuery configuration
+        logger.info(f"🔧 BitQuery config: use_bitquery={self.use_bitquery}, "
+                   f"api_key={'SET' if self.bitquery_api_key else 'NOT SET'}, "
+                   f"max_pools={self.max_pools}")
+        print(f"🔧 [AERODROME] BitQuery config: use_bitquery={self.use_bitquery}, "
+              f"api_key={'SET' if self.bitquery_api_key else 'NOT SET'}, "
+              f"max_pools={self.max_pools}", flush=True)
+
+        # Try BitQuery API first if enabled
+        if self.use_bitquery:
+            logger.info("✅ BitQuery is ENABLED - attempting BitQuery API method")
+            print("✅ [AERODROME] BitQuery is ENABLED - attempting BitQuery API method", flush=True)
+            try:
+                pools = await self._get_pools_via_bitquery()
+                logger.info(f"✅ BitQuery method succeeded: {len(pools)} pools returned")
+                print(f"✅ [AERODROME] BitQuery method succeeded: {len(pools)} pools returned", flush=True)
+                return pools
+            except Exception as e:
+                logger.warning(
+                    f"❌ BitQuery failed: {e}. Falling back to factory method with limit={self.max_pools}"
+                )
+                print(f"❌ [AERODROME] BitQuery failed: {e}. Falling back to factory method", flush=True)
+                # Fall through to factory method
+        else:
+            logger.info(f"⚠️  BitQuery is DISABLED - using factory method directly")
+            print("⚠️  [AERODROME] BitQuery is DISABLED - using factory method directly", flush=True)
+
+        # Fallback: Direct factory queries (legacy method)
+        logger.info(f"🏭 Using factory method with max_pools={self.max_pools}")
+        print(f"🏭 [AERODROME] Using factory method with max_pools={self.max_pools}", flush=True)
+        return await self._get_pools_via_factory()
+
+    async def _get_pools_via_bitquery(self) -> List[ProtocolPool]:
+        """Fetch pools using BitQuery API + on-chain validation.
+
+        Returns:
+            List of validated Aerodrome pools
+        """
+        logger.info("🔍 Using BitQuery to filter Aerodrome pools...")
+        print("🔍 [BITQUERY] Using BitQuery to filter Aerodrome pools...", flush=True)
+        logger.info(f"   Filters: min_tvl=${self.aerodrome_min_tvl_usd}, "
+                   f"min_volume_24h=${self.aerodrome_min_volume_24h}, "
+                   f"tokens={self.aerodrome_token_whitelist}")
+        print(f"   Filters: min_tvl=${self.aerodrome_min_tvl_usd}, "
+              f"min_volume_24h=${self.aerodrome_min_volume_24h}, "
+              f"tokens={self.aerodrome_token_whitelist}", flush=True)
+
+        # Create BitQuery client
+        logger.info("📡 Creating BitQuery client...")
+        print("📡 [BITQUERY] Creating BitQuery client...", flush=True)
+        bitquery_client = await create_bitquery_client(
+            api_key=self.bitquery_api_key,
+            min_tvl_usd=self.aerodrome_min_tvl_usd,
+            min_volume_24h=self.aerodrome_min_volume_24h,
+            token_whitelist=self.aerodrome_token_whitelist,
+        )
+        logger.info("✅ BitQuery client created successfully")
+        print("✅ [BITQUERY] Client created successfully", flush=True)
+
+        try:
+            # Get filtered pool list from BitQuery
+            logger.info("🌐 Calling BitQuery API...")
+            print("🌐 [BITQUERY] Calling BitQuery API...", flush=True)
+            bitquery_pools = await bitquery_client.get_quality_pools()
+            logger.info(f"✅ BitQuery API call completed")
+            print(f"✅ [BITQUERY] API call completed", flush=True)
+
+            if not bitquery_pools:
+                logger.warning("BitQuery returned no pools, falling back to factory")
+                print("⚠️  [BITQUERY] No pools returned, falling back to factory", flush=True)
+                raise ValueError("No pools returned from BitQuery")
+
+            logger.info(f"BitQuery returned {len(bitquery_pools)} candidate pools")
+            print(f"📊 [BITQUERY] Returned {len(bitquery_pools)} candidate pools", flush=True)
+
+            # Sort by volume (highest first) and limit to top N for on-chain validation
+            # This prevents timeout by only validating the most active pools
+            bitquery_pools = sorted(
+                bitquery_pools,
+                key=lambda p: p.get("volume_24h_usd", 0),
+                reverse=True
+            )
+
+            # Get Web3 instance for on-chain validation
+            settings = get_settings()
+            w3 = get_web3("base-mainnet", config=settings)
+            factory_address = AERODROME_CONTRACTS["base-mainnet"]["factory"]
+            factory = ContractHelper.get_contract(w3, factory_address, AERODROME_FACTORY_ABI)
+
+            # Validate each pool on-chain and fetch real-time data
+            pools = []
+            max_to_fetch = min(len(bitquery_pools), self.max_pools)
+
+            logger.info(
+                f"Validating top {max_to_fetch} pools by volume on-chain "
+                f"(from {len(bitquery_pools)} BitQuery results)..."
+            )
+            print(f"🔄 [BITQUERY] Validating top {max_to_fetch} pools on-chain...", flush=True)
+
+            for i, pool_info in enumerate(bitquery_pools[:max_to_fetch]):
+                print(f"   [{i+1}/{max_to_fetch}] Validating pool {pool_info.get('pool_address', 'unknown')[:10]}...", flush=True)
+                try:
+                    pool_address = pool_info["pool_address"]
+
+                    # Query real-time pool data on-chain
+                    pool_data = await self._query_pool_data(w3, pool_address, factory)
+
+                    if pool_data:
+                        pools.append(pool_data)
+                        logger.debug(
+                            f"[{i+1}/{max_to_fetch}] Validated {pool_data.pool_id} "
+                            f"(TVL: ${pool_data.tvl:.2f})"
+                        )
+
+                except Exception as e:
+                    logger.warning(f"Failed to validate pool {pool_address}: {e}")
+                    continue
+
+            logger.info(f"✅ BitQuery method: Successfully fetched {len(pools)} validated pools")
+            return pools
+
+        finally:
+            await bitquery_client.close()
+
+    async def _get_pools_via_factory(self) -> List[ProtocolPool]:
+        """Fetch pools using direct factory queries (legacy fallback method).
+
+        This is the original method that queries pools sequentially from the factory.
+        Much slower than BitQuery, but guaranteed to work.
+
+        Returns:
+            List of Aerodrome pools
+        """
+        logger.info(f"📡 Using factory method (max {self.max_pools} pools)...")
+
+        # Get Web3 instance for Base mainnet
         settings = get_settings()
         w3 = get_web3("base-mainnet", config=settings)
 
@@ -413,19 +569,24 @@ class AerodromeProtocol(BaseProtocol):
         factory = ContractHelper.get_contract(w3, factory_address, AERODROME_FACTORY_ABI)
 
         # Get total number of pools
-        pool_count = factory.functions.allPoolsLength().call()
+        pool_count = await asyncio.to_thread(factory.functions.allPoolsLength().call)
         logger.info(f"Found {pool_count} total pools in Aerodrome factory")
 
-        # Fetch pool data
+        # Fetch pool data (limited by max_pools)
         pools = []
         fetch_count = min(pool_count, self.max_pools)
+
+        logger.warning(
+            f"⚠️ Factory method will only check first {fetch_count} pools "
+            f"(out of {pool_count} total). Consider enabling BitQuery for better coverage."
+        )
 
         for i in range(fetch_count):
             try:
                 # Get pool address
-                pool_address = factory.functions.allPools(i).call()
+                pool_address = await asyncio.to_thread(factory.functions.allPools(i).call)
 
-                # Query pool data (async due to price oracle)
+                # Query pool data
                 pool_data = await self._query_pool_data(w3, pool_address, factory)
 
                 if pool_data:
@@ -439,13 +600,11 @@ class AerodromeProtocol(BaseProtocol):
                             f"(tokens not in supported list)"
                         )
 
-                logger.debug(f"Fetched pool {i+1}/{fetch_count}: {pool_address}")
-
             except Exception as e:
                 logger.warning(f"Failed to fetch pool {i}: {e}")
                 continue
 
-        logger.info(f"✅ Successfully fetched {len(pools)} real Aerodrome pools")
+        logger.info(f"✅ Factory method: Successfully fetched {len(pools)} pools")
         return pools
 
     async def _query_pool_data(
@@ -462,30 +621,40 @@ class AerodromeProtocol(BaseProtocol):
             ProtocolPool with real data, or None if query fails
         """
         try:
+            # Ensure pool address is checksummed (BitQuery returns lowercase addresses)
+            pool_address = w3.to_checksum_address(pool_address)
             # Get pool contract
             pool = ContractHelper.get_contract(w3, pool_address, AERODROME_POOL_ABI)
 
             # Get pool metadata (includes tokens, reserves, decimals, stable flag)
-            metadata = pool.functions.metadata().call()
+            metadata = await asyncio.to_thread(pool.functions.metadata().call)
             dec0, dec1, reserve0, reserve1, is_stable, token0_addr, token1_addr = metadata
 
-            # Get token symbols
-            token0_symbol = self._get_token_symbol(w3, token0_addr)
-            token1_symbol = self._get_token_symbol(w3, token1_addr)
+            # Get token symbols (async to avoid blocking)
+            token0_symbol = await self._get_token_symbol(w3, token0_addr)
+            token1_symbol = await self._get_token_symbol(w3, token1_addr)
 
-            # Get pool name
+            # Get pool name (wrap blocking call in thread pool)
             try:
-                pool_name = pool.functions.name().call()
+                pool_name = await asyncio.to_thread(pool.functions.name().call)
             except:
                 pool_name = f"{token0_symbol}/{token1_symbol} Pool"
 
-            # Calculate TVL using Chainlink price oracle
-            tvl, tvl_metadata = await self._estimate_tvl(
-                reserve0, reserve1, dec0, dec1, token0_symbol, token1_symbol
-            )
+            # Calculate TVL using Chainlink price oracle (with timeout protection)
+            try:
+                tvl, tvl_metadata = await asyncio.wait_for(
+                    self._estimate_tvl(
+                        reserve0, reserve1, dec0, dec1, token0_symbol, token1_symbol
+                    ),
+                    timeout=15.0  # 15 second timeout for TVL estimation
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"TVL estimation timed out for {token0_symbol}/{token1_symbol}")
+                tvl = Decimal("0")
+                tvl_metadata = {"error": "timeout"}
 
-            # Get fee from factory
-            fee = factory.functions.getFee(pool_address, is_stable).call()
+            # Get fee from factory (wrap blocking call in thread pool)
+            fee = await asyncio.to_thread(factory.functions.getFee(pool_address, is_stable).call)
             fee_percent = Decimal(fee) / Decimal(10000)  # Convert basis points to percent
 
             # Create pool ID
@@ -510,7 +679,7 @@ class AerodromeProtocol(BaseProtocol):
             # Merge TVL pricing metadata
             pool_metadata.update(tvl_metadata)
 
-            return ProtocolPool(
+            pool = ProtocolPool(
                 pool_id=pool_id,
                 name=pool_name,
                 tokens=[token0_symbol, token1_symbol],
@@ -518,13 +687,14 @@ class AerodromeProtocol(BaseProtocol):
                 tvl=tvl,
                 metadata=pool_metadata,
             )
+            return pool
 
         except Exception as e:
             logger.error(f"Failed to query pool {pool_address}: {e}")
             return None
 
-    def _get_token_symbol(self, w3: Any, token_address: str) -> str:
-        """Get token symbol from contract.
+    async def _get_token_symbol(self, w3: Any, token_address: str) -> str:
+        """Get token symbol from contract (async to avoid blocking).
 
         Args:
             w3: Web3 instance
@@ -535,7 +705,8 @@ class AerodromeProtocol(BaseProtocol):
         """
         try:
             token = ContractHelper.get_erc20_contract(w3, token_address)
-            symbol = token.functions.symbol().call()
+            # Wrap blocking call in thread pool
+            symbol = await asyncio.to_thread(token.functions.symbol().call)
             return symbol
         except Exception as e:
             logger.warning(f"Could not get symbol for {token_address}: {e}")
@@ -573,8 +744,10 @@ class AerodromeProtocol(BaseProtocol):
             - price_source: Network prices were fetched from
         """
         # Convert reserves to human-readable amounts
-        amount0 = Decimal(reserve0) / Decimal(10**decimals0)
-        amount1 = Decimal(reserve1) / Decimal(10**decimals1)
+        # Note: Aerodrome metadata() returns decimals as 10^n (multiplier), not n
+        # So dec0=1000000 means 6 decimals (10^6), not that we need to compute 10^1000000
+        amount0 = Decimal(reserve0) / Decimal(decimals0)
+        amount1 = Decimal(reserve1) / Decimal(decimals1)
 
         # Initialize metadata
         metadata = {
@@ -583,20 +756,15 @@ class AerodromeProtocol(BaseProtocol):
         }
 
         try:
-            # Get prices from oracle (async call)
-            prices = await self.price_oracle.get_prices([token0_symbol, token1_symbol])
-
-            if token0_symbol not in prices or token1_symbol not in prices:
-                # Partial price failure - try individual queries
-                logger.warning(
-                    f"Batch price query incomplete for {token0_symbol}/{token1_symbol}, "
-                    f"trying individual queries"
-                )
-                price0 = await self.price_oracle.get_price(token0_symbol)
-                price1 = await self.price_oracle.get_price(token1_symbol)
-            else:
-                price0 = prices[token0_symbol]
-                price1 = prices[token1_symbol]
+            # Get prices from oracle with timeout (individual calls are more robust)
+            price0 = await asyncio.wait_for(
+                self.price_oracle.get_price(token0_symbol),
+                timeout=10.0
+            )
+            price1 = await asyncio.wait_for(
+                self.price_oracle.get_price(token1_symbol),
+                timeout=10.0
+            )
 
             # Calculate TVL using real prices
             tvl = (amount0 * price0) + (amount1 * price1)
@@ -616,6 +784,22 @@ class AerodromeProtocol(BaseProtocol):
 
             return tvl, metadata
 
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Timeout fetching prices for {token0_symbol}/{token1_symbol}. "
+                f"Using $1 fallback estimate."
+            )
+            # Fallback to $1 per token estimate
+            tvl = amount0 + amount1
+            metadata.update({
+                "price0_usd": "1.00",
+                "price1_usd": "1.00",
+                "tvl_method": "fallback_estimate",
+                "tvl_error": "timeout",
+                "tvl_warning": "Price fetch timeout - using $1 per token estimate",
+            })
+            return tvl, metadata
+
         except Exception as e:
             # If price fetching fails, log error and use fallback
             logger.error(
@@ -633,5 +817,4 @@ class AerodromeProtocol(BaseProtocol):
                 "tvl_error": str(e),
                 "tvl_warning": "Prices unavailable - using $1 per token estimate",
             })
-
             return tvl, metadata

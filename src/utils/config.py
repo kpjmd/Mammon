@@ -216,6 +216,30 @@ class Settings(BaseSettings):
         description="Comma-separated list of supported tokens with Chainlink feeds",
     )
 
+    # Aerodrome BitQuery Integration (Phase 4 Sprint 4)
+    aerodrome_use_bitquery: bool = Field(
+        default=True,
+        description="Use BitQuery API for fast Aerodrome pool discovery (recommended)",
+    )
+    bitquery_api_key: Optional[str] = Field(
+        default=None,
+        description="BitQuery API key (optional - free tier works without key)",
+    )
+    aerodrome_min_tvl_usd: Decimal = Field(
+        default=Decimal("10000"),
+        description="Minimum TVL filter for Aerodrome pools (USD)",
+        ge=0,
+    )
+    aerodrome_min_volume_24h: Decimal = Field(
+        default=Decimal("100"),
+        description="Minimum 24h volume filter for Aerodrome pools (USD)",
+        ge=0,
+    )
+    aerodrome_token_whitelist: str = Field(
+        default="USDC,WETH,USDT,DAI,WBTC,AERO",
+        description="Comma-separated list of tokens for Aerodrome pool filtering",
+    )
+
     # Circuit Breaker Settings
     rpc_failure_threshold: int = Field(
         default=3,

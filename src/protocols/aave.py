@@ -223,6 +223,8 @@ class AaveV3Protocol(BaseProtocol):
         Returns:
             List of Aave lending markets
         """
+        logger.info(f"📡 [AAVE V3] Fetching pools from Base mainnet...")
+
         # Log pool query
         await self.audit_logger.log_event(
             AuditEventType.POOL_QUERY,
@@ -238,12 +240,14 @@ class AaveV3Protocol(BaseProtocol):
         try:
             # Get list of all reserves (assets) from Aave
             reserve_addresses = self.pool_contract.functions.getReservesList().call()
-            logger.info(f"Found {len(reserve_addresses)} Aave V3 reserves on Base mainnet")
+            logger.info(f"[AAVE V3] Found {len(reserve_addresses)} reserves on Base mainnet")
 
             pools = []
 
             for asset_address in reserve_addresses:
                 try:
+                    logger.info(f"[AAVE V3] Processing reserve: {asset_address}")
+
                     # Get reserve data
                     reserve_data = self.pool_contract.functions.getReserveData(asset_address).call()
 
@@ -254,6 +258,7 @@ class AaveV3Protocol(BaseProtocol):
                     )
                     token_symbol = token_contract.functions.symbol().call()
                     decimals = token_contract.functions.decimals().call()
+                    logger.info(f"[AAVE V3] Token identified: {token_symbol} (decimals={decimals})")
 
                     # Get aToken (interest-bearing token) info for TVL
                     atoken_address = reserve_data[8]  # aTokenAddress
@@ -265,9 +270,25 @@ class AaveV3Protocol(BaseProtocol):
 
                     # Convert to human-readable amount
                     tvl_tokens = Decimal(total_supply) / Decimal(10**decimals)
+                    logger.info(f"[AAVE V3] {token_symbol} aToken total supply: {tvl_tokens}")
 
-                    # Get USD price for TVL
-                    token_price_usd = await self.price_oracle.get_price(token_symbol)
+                    # Get USD price for TVL with fallback
+                    try:
+                        token_price_usd = await self.price_oracle.get_price(token_symbol)
+                        logger.info(f"[AAVE V3] {token_symbol} price from oracle: ${token_price_usd}")
+                    except Exception as e:
+                        logger.warning(
+                            f"[AAVE V3] Price oracle failed for {token_symbol}: {e}, using $1 fallback"
+                        )
+                        # Fallback to $1 for stablecoins, skip others
+                        stablecoins = ["USDC", "USDT", "DAI", "USDBC", "USDbC"]
+                        if token_symbol.upper() in stablecoins:
+                            token_price_usd = Decimal("1")
+                        else:
+                            # Skip non-stablecoins without prices
+                            logger.warning(f"[AAVE V3] Skipping {token_symbol} (no price available)")
+                            continue
+
                     tvl_usd = tvl_tokens * token_price_usd
 
                     # Extract rates from reserve data
@@ -303,8 +324,8 @@ class AaveV3Protocol(BaseProtocol):
 
                     pools.append(pool)
                     logger.info(
-                        f"Aave V3 {token_symbol}: {supply_apy:.2f}% APY, "
-                        f"${tvl_usd:,.0f} TVL"
+                        f"✅ [AAVE V3] {token_symbol}: {supply_apy:.2f}% APY, "
+                        f"${tvl_usd:,.0f} TVL, pool added successfully"
                     )
 
                 except Exception as e:

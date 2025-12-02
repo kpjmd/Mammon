@@ -9,6 +9,7 @@ Critical for autonomous operation and x402 marketplace credibility.
 from typing import Dict, List, Optional
 from decimal import Decimal
 from datetime import datetime, timedelta
+import asyncio
 from sqlalchemy import create_engine, and_, desc
 from sqlalchemy.orm import sessionmaker, Session
 from src.data.models import Base, Position, PositionSnapshot
@@ -38,7 +39,11 @@ class PositionTracker:
             db_path: Path to SQLite database file
         """
         self.db_path = db_path
-        self.engine = create_engine(f"sqlite:///{db_path}")
+        # Add timeout to prevent hanging on database locks
+        self.engine = create_engine(
+            f"sqlite:///{db_path}",
+            connect_args={"timeout": 10}  # 10 second timeout
+        )
         Base.metadata.create_all(self.engine)
         SessionLocal = sessionmaker(bind=self.engine)
         self.session: Session = SessionLocal()
@@ -57,7 +62,7 @@ class PositionTracker:
         predicted_annual_gain: Optional[Decimal] = None,
         gas_cost_usd: Optional[Decimal] = None,
     ) -> int:
-        """Record a new position or update existing one.
+        """Record a new position or update existing one (non-blocking).
 
         Args:
             wallet_address: Wallet holding the position
@@ -74,56 +79,60 @@ class PositionTracker:
         Returns:
             Position ID
         """
-        # Check if position already exists (active position in same pool)
-        existing = self.session.query(Position).filter(
-            and_(
-                Position.wallet_address == wallet_address,
-                Position.protocol == protocol,
-                Position.pool_id == pool_id,
-                Position.token == token,
-                Position.status == "active"
-            )
-        ).first()
+        # Run database operations in thread pool
+        def _record_position():
+            # Check if position already exists (active position in same pool)
+            existing = self.session.query(Position).filter(
+                and_(
+                    Position.wallet_address == wallet_address,
+                    Position.protocol == protocol,
+                    Position.pool_id == pool_id,
+                    Position.token == token,
+                    Position.status == "active"
+                )
+            ).first()
 
-        if existing:
-            # Update existing position
-            existing.amount = amount
-            existing.value_usd = value_usd
-            existing.current_apy = current_apy
-            existing.updated_at = datetime.utcnow()
-            logger.info(
-                f"📝 Updated position: {protocol} {token} = {amount} "
-                f"(${value_usd:.2f} @ {current_apy:.2f}% APY)"
-            )
-            position_id = existing.id
-        else:
-            # Create new position
-            position = Position(
-                wallet_address=wallet_address,
-                protocol=protocol,
-                pool_id=pool_id,
-                token=token,
-                amount=amount,
-                value_usd=value_usd,
-                entry_apy=current_apy,
-                current_apy=current_apy,
-                opened_at=datetime.utcnow(),
-                status="active",
-            )
-            self.session.add(position)
-            self.session.flush()  # Get the ID
-            position_id = position.id
+            if existing:
+                # Update existing position
+                existing.amount = amount
+                existing.value_usd = value_usd
+                existing.current_apy = current_apy
+                existing.updated_at = datetime.utcnow()
+                logger.info(
+                    f"📝 Updated position: {protocol} {token} = {amount} "
+                    f"(${value_usd:.2f} @ {current_apy:.2f}% APY)"
+                )
+                position_id = existing.id
+            else:
+                # Create new position
+                position = Position(
+                    wallet_address=wallet_address,
+                    protocol=protocol,
+                    pool_id=pool_id,
+                    token=token,
+                    amount=amount,
+                    value_usd=value_usd,
+                    entry_apy=current_apy,
+                    current_apy=current_apy,
+                    opened_at=datetime.utcnow(),
+                    status="active",
+                )
+                self.session.add(position)
+                self.session.flush()  # Get the ID
+                position_id = position.id
 
-            logger.info(
-                f"✨ New position recorded: {protocol} {token} = {amount} "
-                f"(${value_usd:.2f} @ {current_apy:.2f}% APY)"
-            )
+                logger.info(
+                    f"✨ New position recorded: {protocol} {token} = {amount} "
+                    f"(${value_usd:.2f} @ {current_apy:.2f}% APY)"
+                )
 
-            if predicted_30d_roi:
-                logger.info(f"🎯 Predicted 30d ROI: {predicted_30d_roi:.4f}%")
+                if predicted_30d_roi:
+                    logger.info(f"🎯 Predicted 30d ROI: {predicted_30d_roi:.4f}%")
 
-        self.session.commit()
-        return position_id
+            self.session.commit()
+            return position_id
+
+        return await asyncio.to_thread(_record_position)
 
     async def close_position(
         self,
@@ -131,7 +140,7 @@ class PositionTracker:
         actual_value_usd: Decimal,
         actual_roi: Optional[Decimal] = None,
     ) -> Dict:
-        """Close a position and calculate final performance.
+        """Close a position and calculate final performance (non-blocking).
 
         Args:
             position_id: Position to close
@@ -141,48 +150,52 @@ class PositionTracker:
         Returns:
             Performance summary with prediction accuracy
         """
-        position = self.session.query(Position).get(position_id)
-        if not position:
-            raise ValueError(f"Position {position_id} not found")
+        def _close_position():
+            position = self.session.query(Position).get(position_id)
+            if not position:
+                raise ValueError(f"Position {position_id} not found")
 
-        position.status = "closed"
-        position.closed_at = datetime.utcnow()
-        position.value_usd = actual_value_usd
+            position.status = "closed"
+            position.closed_at = datetime.utcnow()
+            position.value_usd = actual_value_usd
 
-        # Calculate actual performance
-        days_held = (position.closed_at - position.opened_at).days
-        if days_held == 0:
-            days_held = 1  # Minimum 1 day
+            # Calculate actual performance
+            days_held = (position.closed_at - position.opened_at).days
+            if days_held == 0:
+                days_held = 1  # Minimum 1 day
 
-        # Calculate actual ROI if not provided
-        if actual_roi is None and position.value_usd:
-            initial_value = Decimal(str(position.value_usd))  # Entry value
-            final_value = actual_value_usd
-            actual_roi = ((final_value - initial_value) / initial_value) * 100
+            # Calculate actual ROI if not provided
+            roi = actual_roi
+            if roi is None and position.value_usd:
+                initial_value = Decimal(str(position.value_usd))  # Entry value
+                final_value = actual_value_usd
+                roi = ((final_value - initial_value) / initial_value) * 100
 
-        self.session.commit()
+            self.session.commit()
 
-        logger.info(
-            f"🏁 Closed position: {position.protocol} {position.token} "
-            f"(held {days_held} days, ROI: {actual_roi:.4f}%)"
-        )
+            logger.info(
+                f"🏁 Closed position: {position.protocol} {position.token} "
+                f"(held {days_held} days, ROI: {roi:.4f}%)"
+            )
 
-        return {
-            "position_id": position_id,
-            "protocol": position.protocol,
-            "token": position.token,
-            "days_held": days_held,
-            "entry_apy": position.entry_apy,
-            "actual_roi": actual_roi,
-            "entry_value_usd": position.value_usd,
-            "final_value_usd": actual_value_usd,
-        }
+            return {
+                "position_id": position_id,
+                "protocol": position.protocol,
+                "token": position.token,
+                "days_held": days_held,
+                "entry_apy": position.entry_apy,
+                "actual_roi": roi,
+                "entry_value_usd": position.value_usd,
+                "final_value_usd": actual_value_usd,
+            }
+
+        return await asyncio.to_thread(_close_position)
 
     async def close_all_positions(
         self,
         wallet_address: Optional[str] = None,
     ) -> int:
-        """Close all active positions (optionally filtered by wallet).
+        """Close all active positions (optionally filtered by wallet) (non-blocking).
 
         Useful for position detection to clear stale data before re-scanning.
 
@@ -192,22 +205,25 @@ class PositionTracker:
         Returns:
             Number of positions closed
         """
-        query = self.session.query(Position).filter(Position.status == "active")
+        def _close_all_positions():
+            query = self.session.query(Position).filter(Position.status == "active")
 
-        if wallet_address:
-            query = query.filter(Position.wallet_address == wallet_address)
+            if wallet_address:
+                query = query.filter(Position.wallet_address == wallet_address)
 
-        positions = query.all()
-        count = len(positions)
+            positions = query.all()
+            count = len(positions)
 
-        for position in positions:
-            position.status = "closed"
-            position.closed_at = datetime.utcnow()
+            for position in positions:
+                position.status = "closed"
+                position.closed_at = datetime.utcnow()
 
-        self.session.commit()
+            self.session.commit()
 
-        logger.info(f"🧹 Closed {count} active positions" + (f" for wallet {wallet_address}" if wallet_address else ""))
-        return count
+            logger.info(f"🧹 Closed {count} active positions" + (f" for wallet {wallet_address}" if wallet_address else ""))
+            return count
+
+        return await asyncio.to_thread(_close_all_positions)
 
     async def update_position_performance(
         self,
@@ -215,33 +231,36 @@ class PositionTracker:
         current_apy: Decimal,
         current_value_usd: Decimal,
     ) -> None:
-        """Update position with current performance data.
+        """Update position with current performance data (non-blocking).
 
         Args:
             position_id: Position to update
             current_apy: Current APY (may have changed)
             current_value_usd: Current USD value
         """
-        position = self.session.query(Position).get(position_id)
-        if not position:
-            raise ValueError(f"Position {position_id} not found")
+        def _update_position():
+            position = self.session.query(Position).get(position_id)
+            if not position:
+                raise ValueError(f"Position {position_id} not found")
 
-        position.current_apy = current_apy
-        position.value_usd = current_value_usd
-        position.updated_at = datetime.utcnow()
-        self.session.commit()
+            position.current_apy = current_apy
+            position.value_usd = current_value_usd
+            position.updated_at = datetime.utcnow()
+            self.session.commit()
 
-        logger.debug(
-            f"📊 Updated position {position_id}: "
-            f"APY={current_apy:.2f}%, Value=${current_value_usd:.2f}"
-        )
+            logger.debug(
+                f"📊 Updated position {position_id}: "
+                f"APY={current_apy:.2f}%, Value=${current_value_usd:.2f}"
+            )
+
+        await asyncio.to_thread(_update_position)
 
     async def get_current_positions(
         self,
         wallet_address: Optional[str] = None,
         protocol: Optional[str] = None,
     ) -> List[PositionSnapshot]:
-        """Get all active positions.
+        """Get all active positions (non-blocking).
 
         Args:
             wallet_address: Filter by wallet (optional)
@@ -250,14 +269,19 @@ class PositionTracker:
         Returns:
             List of active position snapshots
         """
-        query = self.session.query(Position).filter(Position.status == "active")
+        # Run synchronous database query in thread pool to avoid blocking event loop
+        def _query_positions():
+            query = self.session.query(Position).filter(Position.status == "active")
 
-        if wallet_address:
-            query = query.filter(Position.wallet_address == wallet_address)
-        if protocol:
-            query = query.filter(Position.protocol == protocol)
+            if wallet_address:
+                query = query.filter(Position.wallet_address == wallet_address)
+            if protocol:
+                query = query.filter(Position.protocol == protocol)
 
-        positions = query.all()
+            return query.all()
+
+        # Execute query in thread pool (non-blocking)
+        positions = await asyncio.to_thread(_query_positions)
 
         snapshots = []
         for pos in positions:
@@ -287,7 +311,7 @@ class PositionTracker:
         days: int = 30,
         wallet_address: Optional[str] = None,
     ) -> List[Position]:
-        """Get historical positions.
+        """Get historical positions (non-blocking).
 
         Args:
             days: Number of days to look back
@@ -296,23 +320,26 @@ class PositionTracker:
         Returns:
             List of positions from the specified period
         """
-        cutoff = datetime.utcnow() - timedelta(days=days)
-        query = self.session.query(Position).filter(
-            Position.created_at >= cutoff
-        )
+        def _get_history():
+            cutoff = datetime.utcnow() - timedelta(days=days)
+            query = self.session.query(Position).filter(
+                Position.created_at >= cutoff
+            )
 
-        if wallet_address:
-            query = query.filter(Position.wallet_address == wallet_address)
+            if wallet_address:
+                query = query.filter(Position.wallet_address == wallet_address)
 
-        positions = query.order_by(desc(Position.created_at)).all()
-        logger.info(f"📜 Found {len(positions)} positions in last {days} days")
-        return positions
+            positions = query.order_by(desc(Position.created_at)).all()
+            logger.info(f"📜 Found {len(positions)} positions in last {days} days")
+            return positions
+
+        return await asyncio.to_thread(_get_history)
 
     async def calculate_realized_apy(
         self,
         position_id: int,
     ) -> Optional[Decimal]:
-        """Calculate the actual realized APY for a position.
+        """Calculate the actual realized APY for a position (non-blocking).
 
         Args:
             position_id: Position to analyze
@@ -320,36 +347,39 @@ class PositionTracker:
         Returns:
             Annualized APY based on actual performance, or None if not enough data
         """
-        position = self.session.query(Position).get(position_id)
-        if not position:
-            return None
+        def _calculate_apy():
+            position = self.session.query(Position).get(position_id)
+            if not position:
+                return None
 
-        if not position.opened_at or not position.value_usd:
-            return None
+            if not position.opened_at or not position.value_usd:
+                return None
 
-        # Calculate time held
-        end_time = position.closed_at or datetime.utcnow()
-        time_held = (end_time - position.opened_at).total_seconds()
-        days_held = time_held / 86400  # Convert to days
+            # Calculate time held
+            end_time = position.closed_at or datetime.utcnow()
+            time_held = (end_time - position.opened_at).total_seconds()
+            days_held = time_held / 86400  # Convert to days
 
-        if days_held < 1:
-            return None  # Need at least 1 day of data
+            if days_held < 1:
+                return None  # Need at least 1 day of data
 
-        # Get current value (or final value if closed)
-        # For simplicity, assume value hasn't changed much (lending positions)
-        # In production, we'd track value snapshots over time
-        current_value = position.value_usd
-        initial_value = position.value_usd  # Entry value
+            # Get current value (or final value if closed)
+            # For simplicity, assume value hasn't changed much (lending positions)
+            # In production, we'd track value snapshots over time
+            current_value = position.value_usd
+            initial_value = position.value_usd  # Entry value
 
-        # Calculate return
-        value_gain = current_value - initial_value
-        roi = (value_gain / initial_value) if initial_value > 0 else Decimal("0")
+            # Calculate return
+            value_gain = current_value - initial_value
+            roi = (value_gain / initial_value) if initial_value > 0 else Decimal("0")
 
-        # Annualize
-        days_per_year = Decimal("365.25")
-        realized_apy = roi * (days_per_year / Decimal(str(days_held)))
+            # Annualize
+            days_per_year = Decimal("365.25")
+            realized_apy = roi * (days_per_year / Decimal(str(days_held)))
 
-        return realized_apy * 100  # Convert to percentage
+            return realized_apy * 100  # Convert to percentage
+
+        return await asyncio.to_thread(_calculate_apy)
 
     async def get_prediction_accuracy(
         self,

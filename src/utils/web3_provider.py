@@ -360,22 +360,48 @@ class Web3Provider:
         Returns:
             True if connection is successful, False otherwise
         """
+        import signal
+        from contextlib import contextmanager
+
+        @contextmanager
+        def timeout_context(seconds):
+            """Context manager for timeout on blocking operations."""
+            def timeout_handler(signum, frame):
+                raise TimeoutError(f"RPC call timed out after {seconds}s")
+
+            # Set up signal handler (Unix only)
+            old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(seconds)
+            try:
+                yield
+            finally:
+                signal.alarm(0)  # Cancel alarm
+                signal.signal(signal.SIGALRM, old_handler)
+
         for attempt in range(max_retries):
             try:
                 # Verify chain ID matches (also confirms RPC is responsive)
-                chain_id = w3.eth.chain_id
-                if chain_id != network.chain_id:
-                    logger.error(
-                        f"Chain ID mismatch: expected {network.chain_id}, got {chain_id}"
-                    )
-                    return False
+                # Add 10-second timeout to prevent hanging on unresponsive RPC
+                with timeout_context(10):
+                    chain_id = w3.eth.chain_id
+                    if chain_id != network.chain_id:
+                        logger.error(
+                            f"Chain ID mismatch: expected {network.chain_id}, got {chain_id}"
+                        )
+                        return False
 
-                # Get latest block to ensure RPC is working
-                block_number = w3.eth.block_number
-                logger.debug(f"Connected to {network.network_id}, latest block: {block_number}")
+                    # Get latest block to ensure RPC is working
+                    block_number = w3.eth.block_number
+                    logger.debug(f"Connected to {network.network_id}, latest block: {block_number}")
 
                 return True
 
+            except TimeoutError as e:
+                logger.warning(
+                    f"Connection verification attempt {attempt + 1}/{max_retries} timed out: {e}"
+                )
+                if attempt < max_retries - 1:
+                    time.sleep(2**attempt)  # Exponential backoff
             except Exception as e:
                 logger.warning(
                     f"Connection verification attempt {attempt + 1}/{max_retries} failed: {e}"

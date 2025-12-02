@@ -200,23 +200,25 @@ class AutonomousRunner:
         yield_scanner = YieldScannerAgent(scanner_config)
         logger.info("✅ STEP 6: YieldScannerAgent created successfully")
 
-        logger.info("⚙️  STEP 7: Creating strategy and optimizer agents")
-        strategy = SimpleYieldStrategy(config)
-        optimizer = OptimizerAgent(config, yield_scanner, strategy)
-        risk_assessor = RiskAssessorAgent(config)
-        logger.info("✅ STEP 7: Strategy and optimizer agents created successfully")
-        print("  ✅ Yield Scanner, Optimizer, Risk Assessor")
-
-        # Calculators and executors
-        logger.info("⚙️  STEP 8: Creating gas estimator and profitability calculator")
+        # Calculators - CRITICAL: Create profitability_calc BEFORE strategy
+        logger.info("⚙️  STEP 7: Creating gas estimator and profitability calculator")
         gas_estimator = GasEstimator(config["network"], oracle)
+        logger.info(f"⚙️  MIN_PROFIT_USD loaded from config: ${config['min_profit_usd']}")
         profitability_calc = ProfitabilityCalculator(
             min_annual_gain_usd=Decimal(str(config["min_profit_usd"])),
             max_break_even_days=config["max_break_even_days"],
             max_cost_pct=Decimal(str(config["max_cost_pct"])),
             gas_estimator=gas_estimator,
         )
-        logger.info("✅ STEP 8: Gas estimator and profitability calculator created successfully")
+        logger.info("✅ STEP 7: Gas estimator and profitability calculator created successfully")
+
+        logger.info("⚙️  STEP 8: Creating strategy and optimizer agents")
+        strategy = SimpleYieldStrategy(config, profitability_calc=profitability_calc)
+        optimizer = OptimizerAgent(config, yield_scanner, strategy)
+        risk_assessor = RiskAssessorAgent(config)
+        logger.info("✅ STEP 8: Strategy and optimizer agents created successfully")
+        print("  ✅ Gas Estimator, Profitability Calculator")
+        print("  ✅ Yield Scanner, Optimizer, Risk Assessor")
 
         logger.info("⚙️  STEP 9: Creating protocol executor and rebalance executor")
         protocol_executor = ProtocolActionExecutor(wallet, config)
@@ -229,7 +231,7 @@ class AutonomousRunner:
         )
         audit_logger = AuditLogger()
         logger.info("✅ STEP 9: Executors created successfully")
-        print("  ✅ Profitability Calculator, Rebalance Executor")
+        print("  ✅ Rebalance Executor")
 
         # Create scheduled optimizer
         logger.info("⚙️  STEP 10: Creating scheduled optimizer")

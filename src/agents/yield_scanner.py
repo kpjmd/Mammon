@@ -20,7 +20,7 @@ from src.utils.circuit_breaker import CircuitBreaker
 logger = get_logger(__name__)
 
 # Circuit breaker configuration
-PROTOCOL_TIMEOUT_SECONDS = 30  # Max time for a single protocol scan
+PROTOCOL_TIMEOUT_SECONDS = 90  # Max time for a single protocol scan (increased for BitQuery + on-chain validation)
 MAX_CONSECUTIVE_FAILURES = 3  # Failures before circuit breaker activates
 CIRCUIT_BREAKER_COOLDOWN_SECONDS = 300  # 5 minutes (reduced from 60 minutes for faster recovery)
 
@@ -97,22 +97,28 @@ class YieldScannerAgent:
         self.dry_run_mode = config.get("dry_run_mode", True)
         self.audit_logger = AuditLogger()
 
-        # Create shared price oracle to avoid duplicate warnings and improve performance
-        chainlink_enabled = config.get("chainlink_enabled", True)
-        if chainlink_enabled:
-            price_network = config.get("chainlink_price_network", "base-mainnet")
-            self.price_oracle = create_price_oracle(
-                "chainlink",
-                network=config.get("network", "base-mainnet"),
-                price_network=price_network,
-                cache_ttl_seconds=config.get("chainlink_cache_ttl_seconds", 300),
-                max_staleness_seconds=config.get("chainlink_max_staleness_seconds", 3600),
-                fallback_to_mock=config.get("chainlink_fallback_to_mock", True),
-            )
-            logger.info(f"✅ Created shared Chainlink price oracle (price_network={price_network})")
+        # Use shared price oracle if provided, otherwise create new one
+        # This prevents duplicate oracle creation during initialization
+        if "price_oracle" in config:
+            self.price_oracle = config["price_oracle"]
+            logger.info("✅ Using shared price oracle (passed from caller)")
         else:
-            self.price_oracle = create_price_oracle("mock")
-            logger.info("✅ Created shared mock price oracle")
+            # Create shared price oracle to avoid duplicate warnings and improve performance
+            chainlink_enabled = config.get("chainlink_enabled", True)
+            if chainlink_enabled:
+                price_network = config.get("chainlink_price_network", "base-mainnet")
+                self.price_oracle = create_price_oracle(
+                    "chainlink",
+                    network=config.get("network", "base-mainnet"),
+                    price_network=price_network,
+                    cache_ttl_seconds=config.get("chainlink_cache_ttl_seconds", 300),
+                    max_staleness_seconds=config.get("chainlink_max_staleness_seconds", 3600),
+                    fallback_to_mock=config.get("chainlink_fallback_to_mock", True),
+                )
+                logger.info(f"✅ Created shared Chainlink price oracle (price_network={price_network})")
+            else:
+                self.price_oracle = create_price_oracle("mock")
+                logger.info("✅ Created shared mock price oracle")
 
         # Initialize protocol integrations with shared oracle
         aerodrome_config = {**config, "price_oracle": self.price_oracle}
@@ -161,12 +167,14 @@ class YieldScannerAgent:
 
         # Check circuit breaker
         if self.circuit_breaker.is_open(protocol.name):
-            logger.warning(f"⚠️  Skipping {protocol.name} - circuit breaker is open")
+            logger.warning(f"Skipping {protocol.name} - circuit breaker is open")
             return opportunities
+
+        # Log start of scan
+        logger.info(f"📡 [{protocol.name.upper()}] Starting protocol scan...")
 
         try:
             # Scan protocol with timeout
-            logger.info(f"Scanning {protocol.name}...")
             pools = await asyncio.wait_for(
                 protocol.get_pools(),
                 timeout=PROTOCOL_TIMEOUT_SECONDS
@@ -189,18 +197,17 @@ class YieldScannerAgent:
             scan_duration = (datetime.now(UTC) - start_time).total_seconds()
             self.circuit_breaker.record_success(protocol.name)
             logger.info(
-                f"✅ {protocol.name}: {len(pools)} opportunities "
-                f"(scanned in {scan_duration:.1f}s)"
+                f"✅ [{protocol.name.upper()}]: {len(pools)} pools (scanned in {scan_duration:.1f}s)"
             )
 
         except asyncio.TimeoutError:
             error_msg = f"Timeout after {PROTOCOL_TIMEOUT_SECONDS}s"
-            logger.error(f"❌ {protocol.name}: {error_msg}")
+            logger.error(f"❌ [{protocol.name.upper()}] Timed out: {error_msg}")
             self.circuit_breaker.record_failure(protocol.name, asyncio.TimeoutError(error_msg))
 
         except Exception as e:
             error_msg = str(e)
-            logger.error(f"❌ {protocol.name}: {error_msg}")
+            logger.error(f"❌ [{protocol.name.upper()}] Failed: {error_msg}", exc_info=True)
             self.circuit_breaker.record_failure(protocol.name, e)
 
         return opportunities
@@ -223,19 +230,25 @@ class YieldScannerAgent:
             {"action": "scan_start", "protocols": len(self.protocols)},
         )
 
-        logger.info(f"🔍 Starting PARALLEL scan of {len(self.protocols)} protocols...")
-
         # Scan all protocols in parallel using asyncio.gather
         protocol_results = await asyncio.gather(
             *[self._scan_single_protocol(protocol) for protocol in self.protocols],
-            return_exceptions=False  # Exceptions handled in _scan_single_protocol
+            return_exceptions=True  # Allow individual protocol failures without killing entire scan
         )
 
-        # Flatten results
+        # Flatten results and handle per-protocol exceptions
         all_opportunities = []
-
-        for opportunities in protocol_results:
-            all_opportunities.extend(opportunities)
+        for i, result in enumerate(protocol_results):
+            if isinstance(result, Exception):
+                protocol_name = self.protocols[i].name
+                logger.error(
+                    f"❌ [{protocol_name.upper()}] Protocol scan failed: {result}",
+                    extra={"action": "protocol_scan_failed", "protocol": protocol_name, "error": str(result)},
+                )
+                # Continue with other protocols - don't let one failure kill the entire scan
+                continue
+            # Result is a list of opportunities
+            all_opportunities.extend(result)
 
         # Sort by APY (highest first)
         sorted_opportunities = sorted(all_opportunities, key=lambda x: x.apy, reverse=True)
@@ -255,9 +268,10 @@ class YieldScannerAgent:
                 "protocols_scanned": len(self.protocols),
             },
         )
+        logger.info(f"✅ SCANNER STEP 6: Completion audit event logged")
 
         logger.info(
-            f"✅ Parallel scan complete: {len(sorted_opportunities)} opportunities "
+            f"✅ SCANNER COMPLETE: {len(sorted_opportunities)} opportunities "
             f"found in {scan_duration:.1f}s"
         )
         if sorted_opportunities:

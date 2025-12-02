@@ -216,7 +216,6 @@ class ScheduledOptimizer:
         Returns:
             List of RebalanceExecution results
         """
-        logger.info("Running single optimization cycle...")
         return await self._execute_optimization_cycle()
 
     async def _run_loop(self) -> None:
@@ -277,16 +276,12 @@ class ScheduledOptimizer:
         Returns:
             List of RebalanceExecution results
         """
-        logger.info("=" * 80)
-        logger.info("Starting optimization cycle")
-        logger.info("=" * 80)
 
         executions: List[RebalanceExecution] = []
 
         try:
             # 1. Get current positions
             current_positions = await self._get_current_positions()
-            logger.info(f"Current positions: {current_positions}")
 
             # 2. Get rebalance recommendations
             recommendations = await self.optimizer.find_rebalance_opportunities(
@@ -294,14 +289,14 @@ class ScheduledOptimizer:
             )
 
             if not recommendations:
-                logger.info("No rebalance opportunities found")
                 return executions
 
             logger.info(f"Found {len(recommendations)} potential opportunities")
             self.status.total_opportunities_found += len(recommendations)
 
             # 3. Filter and execute profitable recommendations
-            for rec in recommendations:
+            for i, rec in enumerate(recommendations, 1):
+
                 # Check daily limits
                 if not self._check_daily_limits():
                     logger.warning("Daily limits reached, skipping remaining opportunities")
@@ -309,13 +304,14 @@ class ScheduledOptimizer:
                     break
 
                 # Check profitability
+                logger.info(f"🔍 SCAN STEP 5.{i}a: Checking profitability...")
                 if not await self._is_profitable(rec):
                     logger.info(f"Skipping unprofitable recommendation: {rec.reason}")
                     self.status.total_opportunities_skipped += 1
                     continue
 
                 # Execute rebalance
-                logger.info(f"Executing: {rec.from_protocol} → {rec.to_protocol}")
+                logger.info(f"🔍 SCAN STEP 5.{i}b: Executing rebalance: {rec.from_protocol} → {rec.to_protocol}")
 
                 try:
                     execution = await self.rebalance_executor.execute_rebalance(rec)

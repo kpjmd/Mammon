@@ -10,6 +10,7 @@ from typing import Dict, List, Optional
 from decimal import Decimal
 from datetime import datetime, timedelta
 from dataclasses import dataclass
+import asyncio
 from sqlalchemy import create_engine, and_, func
 from sqlalchemy.orm import sessionmaker, Session
 from src.data.models import (
@@ -96,7 +97,11 @@ class PerformanceTracker:
             db_path: Path to SQLite database file
         """
         self.db_path = db_path
-        self.engine = create_engine(f"sqlite:///{db_path}")
+        # Add timeout to prevent hanging on database locks
+        self.engine = create_engine(
+            f"sqlite:///{db_path}",
+            connect_args={"timeout": 10}  # 10 second timeout
+        )
         Base.metadata.create_all(self.engine)
         SessionLocal = sessionmaker(bind=self.engine)
         self.session: Session = SessionLocal()
@@ -106,7 +111,7 @@ class PerformanceTracker:
         self,
         execution: RebalanceExecution,
     ) -> int:
-        """Record a rebalance execution for tracking.
+        """Record a rebalance execution for tracking (non-blocking).
 
         Args:
             execution: Rebalance execution details
@@ -114,28 +119,31 @@ class PerformanceTracker:
         Returns:
             Transaction ID
         """
-        # Create transaction record
-        tx = Transaction(
-            tx_hash=execution.tx_hash,
-            from_protocol=execution.from_protocol,
-            to_protocol=execution.to_protocol,
-            operation="rebalance",
-            token=execution.token,
-            amount=execution.amount,
-            status="completed" if execution.success else "failed",
-            created_at=execution.timestamp,
-            completed_at=execution.timestamp,
-        )
-        self.session.add(tx)
-        self.session.flush()
+        def _record_rebalance():
+            # Create transaction record
+            tx = Transaction(
+                tx_hash=execution.tx_hash,
+                from_protocol=execution.from_protocol,
+                to_protocol=execution.to_protocol,
+                operation="rebalance",
+                token=execution.token,
+                amount=execution.amount,
+                status="completed" if execution.success else "failed",
+                created_at=execution.timestamp,
+                completed_at=execution.timestamp,
+            )
+            self.session.add(tx)
+            self.session.flush()
 
-        logger.info(
-            f"📊 Recorded rebalance: {execution.from_protocol} → {execution.to_protocol} "
-            f"({execution.amount} {execution.token}, gas=${execution.gas_cost_usd:.2f})"
-        )
+            logger.info(
+                f"📊 Recorded rebalance: {execution.from_protocol} → {execution.to_protocol} "
+                f"({execution.amount} {execution.token}, gas=${execution.gas_cost_usd:.2f})"
+            )
 
-        self.session.commit()
-        return tx.id
+            self.session.commit()
+            return tx.id
+
+        return await asyncio.to_thread(_record_rebalance)
 
     async def get_metrics(
         self,
