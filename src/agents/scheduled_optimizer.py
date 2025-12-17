@@ -289,6 +289,18 @@ class ScheduledOptimizer:
             )
 
             if not recommendations:
+                # Check if we have idle capital to deploy
+                idle_capital = await self._get_idle_capital()
+
+                if idle_capital:
+                    logger.info("💰 No positions to rebalance, but found idle capital")
+                    self.status.total_opportunities_found += len(idle_capital)
+
+                    deployment_executions = await self._deploy_idle_capital(idle_capital)
+                    executions.extend(deployment_executions)
+                else:
+                    logger.info("No positions and no idle capital - nothing to do")
+
                 return executions
 
             logger.info(f"Found {len(recommendations)} potential opportunities")
@@ -398,6 +410,34 @@ class ScheduledOptimizer:
         logger.warning("⚠️  No position tracker available or error occurred")
         return {}
 
+    async def _get_idle_capital(
+        self, min_amount: Decimal = Decimal("10")
+    ) -> Dict[str, Decimal]:
+        """Detect idle stablecoins in wallet that aren't deployed to protocols.
+
+        Args:
+            min_amount: Minimum amount to consider as deployable (default $10)
+
+        Returns:
+            Dict mapping token symbol to idle amount (e.g., {"USDC": Decimal("100")})
+        """
+        idle_capital: Dict[str, Decimal] = {}
+
+        try:
+            # Check USDC balance (primary stablecoin on Base)
+            usdc_balance = await self.wallet_manager.get_balance("usdc")
+
+            if usdc_balance >= min_amount:
+                idle_capital["USDC"] = usdc_balance
+                logger.info(f"💰 Detected idle capital: {usdc_balance} USDC")
+            else:
+                logger.debug(f"USDC balance {usdc_balance} below minimum {min_amount}")
+
+        except Exception as e:
+            logger.error(f"Error detecting idle capital: {e}")
+
+        return idle_capital
+
     async def _is_profitable(self, recommendation: RebalanceRecommendation) -> bool:
         """Check if recommendation meets profitability criteria.
 
@@ -439,6 +479,138 @@ class ScheduledOptimizer:
         except Exception as e:
             logger.error(f"Error checking profitability: {e}", exc_info=True)
             return False
+
+    async def _is_deployment_profitable(
+        self, recommendation: RebalanceRecommendation
+    ) -> bool:
+        """Check if deploying idle capital is profitable after gas costs.
+
+        For new deployments, we compare expected yield vs gas cost.
+        Since there's no current APY (idle capital earns 0%), any positive
+        yield after gas is profitable.
+
+        Args:
+            recommendation: RebalanceRecommendation for deployment
+
+        Returns:
+            True if profitable, False otherwise
+        """
+        try:
+            # For idle capital, current APY is 0
+            analysis = await self.profitability_calc.calculate_profitability(
+                current_apy=Decimal("0"),  # Idle capital earns nothing
+                target_apy=recommendation.expected_apy,
+                position_size_usd=recommendation.amount,
+                requires_swap=False,  # Same token
+                swap_amount_usd=Decimal("0"),
+            )
+
+            if not analysis.is_profitable:
+                logger.info(
+                    f"Deployment unprofitable: {', '.join(analysis.rejection_reasons)}"
+                )
+                return False
+
+            logger.info(
+                f"✅ Deployment profitable: ${analysis.annual_gain_usd}/year, "
+                f"break-even in {analysis.break_even_days} days"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"Error checking deployment profitability: {e}", exc_info=True)
+            return False
+
+    async def _deploy_idle_capital(
+        self, idle_capital: Dict[str, Decimal]
+    ) -> List[RebalanceExecution]:
+        """Deploy idle capital to the best yield opportunity.
+
+        Args:
+            idle_capital: Dict of token -> idle amount
+
+        Returns:
+            List of RebalanceExecution results
+        """
+        executions: List[RebalanceExecution] = []
+
+        for token, amount in idle_capital.items():
+            try:
+                # Find best yield for this token
+                best_opportunity = await self.yield_scanner.find_best_yield(token)
+
+                if not best_opportunity:
+                    logger.warning(f"No yield opportunity found for {token}")
+                    continue
+
+                logger.info(
+                    f"📊 Best opportunity for {amount} {token}: "
+                    f"{best_opportunity.protocol} @ {best_opportunity.apy}% APY"
+                )
+
+                # Check daily limits
+                if not self._check_daily_limits():
+                    logger.warning(
+                        "Daily limits reached, skipping idle capital deployment"
+                    )
+                    break
+
+                # Create deployment recommendation (from_protocol=None indicates new deposit)
+                recommendation = RebalanceRecommendation(
+                    from_protocol=None,  # No source - this is new capital
+                    to_protocol=best_opportunity.protocol,
+                    token=token,
+                    amount=amount,
+                    expected_apy=best_opportunity.apy,
+                    reason=f"Deploy idle {token} to highest-yielding protocol",
+                    confidence=80,  # High confidence for simple deployment
+                )
+
+                # Check profitability (mainly gas cost vs yield)
+                if not await self._is_deployment_profitable(recommendation):
+                    logger.info("Skipping deployment - not profitable after gas costs")
+                    self.status.total_opportunities_skipped += 1
+                    continue
+
+                # Execute deployment
+                logger.info(f"🚀 Deploying {amount} {token} → {best_opportunity.protocol}")
+
+                execution = await self.rebalance_executor.execute_rebalance(
+                    recommendation
+                )
+                executions.append(execution)
+
+                if execution.success:
+                    self.status.total_rebalances += 1
+                    self.status.total_opportunities_executed += 1
+                    self.status.total_gas_spent_usd += execution.total_gas_cost_usd
+
+                    await self.audit_logger.log_event(
+                        event_type=AuditEventType.REBALANCE_EXECUTED,
+                        severity=AuditSeverity.INFO,
+                        message=f"Idle capital deployed: {token} → {best_opportunity.protocol}",
+                        metadata={
+                            "action": "idle_capital_deployment",
+                            "token": token,
+                            "amount": float(amount),
+                            "to_protocol": best_opportunity.protocol,
+                            "expected_apy": float(best_opportunity.apy),
+                            "gas_cost_usd": float(execution.total_gas_cost_usd),
+                        },
+                    )
+
+                    logger.info(
+                        f"✅ Deployment successful! Gas: ${execution.total_gas_cost_usd}"
+                    )
+                else:
+                    self.status.total_opportunities_skipped += 1
+                    logger.warning(f"❌ Deployment failed: {execution.error}")
+
+            except Exception as e:
+                logger.error(f"Error deploying {token}: {e}", exc_info=True)
+                self.status.total_opportunities_skipped += 1
+
+        return executions
 
     def _check_daily_limits(self) -> bool:
         """Check if daily limits allow more rebalances.
