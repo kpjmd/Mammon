@@ -224,7 +224,7 @@ class WalletManager:
             # ERC20 token balance via Web3 (USDC)
             elif token_upper == "USDC":
                 from src.utils.web3_provider import get_web3
-                from src.utils.contracts import MAINNET_CONTRACTS, TESTNET_CONTRACTS
+                from src.utils.constants import TOKEN_ADDRESSES
 
                 web3 = get_web3()
                 wallet_address = self.wallet_provider.default_address.address_id
@@ -232,9 +232,9 @@ class WalletManager:
                 # Get USDC contract address based on network
                 network = web3.eth.chain_id
                 if network == 8453:  # Base mainnet
-                    usdc_address = MAINNET_CONTRACTS["USDC"]
+                    usdc_address = TOKEN_ADDRESSES["base-mainnet"]["USDC"]
                 elif network == 84532:  # Base Sepolia
-                    usdc_address = TESTNET_CONTRACTS["USDC"]
+                    usdc_address = TOKEN_ADDRESSES["base-sepolia"]["USDC"]
                 else:
                     logger.error(f"Unsupported network for USDC: {network}")
                     return Decimal("0")
