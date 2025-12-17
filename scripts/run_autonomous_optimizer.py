@@ -447,8 +447,14 @@ class AutonomousRunner:
                 print(f"     From: {rec.from_protocol} ({rec.token})")
                 print(f"     To: {rec.to_protocol} ({rec.token})")
                 print(f"     Amount: ${float(rec.amount):.2f}")
-                apy_gain = rec.expected_apy - rec.current_apy
-                print(f"     APY Gain: {apy_gain:.2f}%")
+
+                # Handle idle capital deployment (current_apy is None)
+                if rec.current_apy is not None:
+                    apy_gain = rec.expected_apy - rec.current_apy
+                    print(f"     APY Gain: {apy_gain:.2f}%")
+                else:
+                    print(f"     APY: {rec.expected_apy:.2f}% (new deployment)")
+
                 print(f"     Gas Cost: ${float(execution.total_gas_cost_usd):.4f}")
 
             # Show failed rebalances
