@@ -18,6 +18,12 @@ from src.wallet.local_wallet_provider import LocalWalletProvider
 from src.security.limits import SpendingLimits
 from src.security.audit import AuditLogger, AuditEventType, AuditSeverity
 from src.security.approval import ApprovalManager, ApprovalStatus
+from src.security.transaction_validator import (
+    TransactionValidator,
+    ValidationResult,
+    get_transaction_validator,
+)
+from src.security.contract_whitelist import get_contract_whitelist
 from src.utils.logger import get_logger
 from src.utils.validators import is_valid_ethereum_address
 from src.utils.web3_provider import get_web3
@@ -69,6 +75,14 @@ class WalletManager:
         self.dry_run_mode = config.get("dry_run_mode", True)
         self.audit_logger = AuditLogger()
         self.spending_limits = SpendingLimits(config)
+
+        # Initialize transaction validator for security checks (EIP-7702, Permit2, etc.)
+        self.transaction_validator = get_transaction_validator(
+            strict_mode=config.get("strict_mode", True),
+            eip7702_detection=True,
+            permit2_detection=True,
+        )
+        self.contract_whitelist = get_contract_whitelist(self.network)
 
         # Initialize price oracle (defaults to mock for Phase 1C)
         self.price_oracle = price_oracle or create_price_oracle("mock")
@@ -198,13 +212,63 @@ class WalletManager:
             raise ValueError("Wallet not initialized. Call initialize() first.")
 
         try:
-            # Get balance from CDP wallet provider
-            # NOTE: get_balance is synchronous, not async
-            balance = self.wallet_provider.get_balance(token.lower())
-            balance_decimal = Decimal(str(balance))
+            token_upper = token.upper()
 
-            logger.debug(f"Balance for {token}: {balance_decimal}")
-            return balance_decimal
+            # ETH balance via CDP wallet provider
+            if token_upper == "ETH":
+                balance = self.wallet_provider.get_balance(token.lower())
+                balance_decimal = Decimal(str(balance))
+                logger.debug(f"Balance for {token}: {balance_decimal}")
+                return balance_decimal
+
+            # ERC20 token balance via Web3 (USDC)
+            elif token_upper == "USDC":
+                from src.utils.web3_provider import get_web3
+                from src.utils.contracts import MAINNET_CONTRACTS, TESTNET_CONTRACTS
+
+                web3 = get_web3()
+                wallet_address = self.wallet_provider.default_address.address_id
+
+                # Get USDC contract address based on network
+                network = web3.eth.chain_id
+                if network == 8453:  # Base mainnet
+                    usdc_address = MAINNET_CONTRACTS["USDC"]
+                elif network == 84532:  # Base Sepolia
+                    usdc_address = TESTNET_CONTRACTS["USDC"]
+                else:
+                    logger.error(f"Unsupported network for USDC: {network}")
+                    return Decimal("0")
+
+                # ERC20 balanceOf ABI
+                erc20_abi = [
+                    {
+                        "constant": True,
+                        "inputs": [{"name": "_owner", "type": "address"}],
+                        "name": "balanceOf",
+                        "outputs": [{"name": "balance", "type": "uint256"}],
+                        "type": "function",
+                    }
+                ]
+
+                # Create contract instance
+                usdc_contract = web3.eth.contract(
+                    address=web3.to_checksum_address(usdc_address), abi=erc20_abi
+                )
+
+                # Get balance (USDC has 6 decimals)
+                balance_raw = usdc_contract.functions.balanceOf(
+                    web3.to_checksum_address(wallet_address)
+                ).call()
+
+                balance_decimal = Decimal(balance_raw) / Decimal(10**6)
+                logger.info(f"💰 USDC Balance: {balance_decimal} USDC")
+                return balance_decimal
+
+            else:
+                logger.error(
+                    f"Token {token} not yet supported. Only ETH and USDC are supported."
+                )
+                return Decimal("0")
 
         except Exception as e:
             logger.error(f"Failed to get balance for {token}: {e}")
@@ -514,6 +578,61 @@ class WalletManager:
         # Enforce spending limits
         if not await self._check_spending_limits(amount_usd):
             raise ValueError(f"Transaction exceeds spending limits: ${amount_usd}")
+
+        # CRITICAL SECURITY: Validate transaction for threats (EIP-7702, Permit2, unknown contracts)
+        logger.info("Running security validation...")
+        tx_data_bytes = b""
+        if data:
+            if isinstance(data, str):
+                tx_data_bytes = bytes.fromhex(data[2:] if data.startswith("0x") else data) if data else b""
+            else:
+                tx_data_bytes = data
+
+        # Convert amount to wei for validation (ETH only)
+        value_wei = 0
+        if token == "ETH":
+            w3 = get_web3(self.network)
+            value_wei = int(w3.to_wei(str(amount), "ether"))
+
+        validation_result = self.transaction_validator.validate_transaction(
+            to_address=to,
+            value=value_wei,
+            data=tx_data_bytes,
+            from_address=self.address,
+        )
+
+        if not validation_result.is_valid:
+            # Log security block
+            await self.audit_logger.log_event(
+                AuditEventType.VALIDATION_FAILED,
+                AuditSeverity.ERROR,
+                f"Transaction blocked by security validation: {validation_result.rejection_reason}",
+                metadata={
+                    "to": to,
+                    "amount": str(amount),
+                    "token": token,
+                    "threats": [t.threat_type.value for t in validation_result.threats],
+                    "rejection_reason": validation_result.rejection_reason,
+                }
+            )
+
+            # Log individual threats
+            for threat in validation_result.threats:
+                await self.audit_logger.log_threat_detection(
+                    threat_type=threat.threat_type.value,
+                    description=threat.description,
+                    to_address=to,
+                )
+
+            raise ValueError(
+                f"SECURITY: Transaction blocked - {validation_result.rejection_reason}"
+            )
+
+        # Log security warnings if any
+        for warning in validation_result.warnings:
+            logger.warning(f"Security warning: {warning}")
+
+        logger.info("Security validation passed")
 
         # Check if approval required
         if self.approval_manager and self.approval_manager.requires_approval(amount_usd):
