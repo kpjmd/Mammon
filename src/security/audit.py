@@ -41,6 +41,18 @@ class AuditEventType(Enum):
     RPC_ENDPOINT_FAILURE = "rpc_endpoint_failure"
     RPC_CIRCUIT_BREAKER_OPENED = "rpc_circuit_breaker_opened"
 
+    # Phase 5: Tiered wallet security events
+    EIP7702_DETECTED = "eip7702_detected"
+    PERMIT2_DETECTED = "permit2_detected"
+    CONTRACT_WHITELIST_BLOCK = "contract_whitelist_block"
+    THREAT_DETECTED = "threat_detected"
+    HOT_WALLET_PAUSED = "hot_wallet_paused"
+    HOT_WALLET_RESUMED = "hot_wallet_resumed"
+    WALLET_TIER_CHANGE = "wallet_tier_change"
+    APPROVAL_TIMEOUT = "approval_timeout"
+    VALIDATION_FAILED = "validation_failed"
+    SPENDING_LIMIT_BREACH = "spending_limit_breach"
+
 
 class AuditSeverity(Enum):
     """Severity levels for audit events."""
@@ -311,5 +323,175 @@ class AuditLogger:
                 "endpoint": endpoint_provider,
                 "network": network,
                 "failure_count": failure_count,
+            },
+        )
+
+    # Phase 5: Tiered wallet security logging methods
+
+    async def log_threat_detection(
+        self,
+        threat_type: str,
+        description: str,
+        severity: AuditSeverity = AuditSeverity.CRITICAL,
+        to_address: Optional[str] = None,
+        tx_data_preview: Optional[str] = None,
+        **metadata: Any,
+    ) -> None:
+        """Log a detected security threat.
+
+        Args:
+            threat_type: Type of threat (eip7702, permit2, etc.)
+            description: Human-readable description
+            severity: Threat severity
+            to_address: Target address if applicable
+            tx_data_preview: First 100 bytes of tx data (hex)
+            **metadata: Additional context
+        """
+        event_type_map = {
+            "eip7702_delegation": AuditEventType.EIP7702_DETECTED,
+            "permit2_unlimited": AuditEventType.PERMIT2_DETECTED,
+            "permit2_suspicious": AuditEventType.PERMIT2_DETECTED,
+            "unknown_contract": AuditEventType.CONTRACT_WHITELIST_BLOCK,
+            "blocked_contract": AuditEventType.CONTRACT_WHITELIST_BLOCK,
+        }
+
+        event_type = event_type_map.get(threat_type, AuditEventType.THREAT_DETECTED)
+
+        await self.log_event(
+            event_type=event_type,
+            severity=severity,
+            message=f"THREAT DETECTED: {description}",
+            metadata={
+                "threat_type": threat_type,
+                "to_address": to_address,
+                "tx_data_preview": tx_data_preview[:200] if tx_data_preview else None,
+                **metadata,
+            },
+        )
+
+    async def log_whitelist_block(
+        self,
+        to_address: str,
+        reason: str,
+        tx_value_wei: Optional[int] = None,
+        **metadata: Any,
+    ) -> None:
+        """Log a transaction blocked due to whitelist enforcement.
+
+        Args:
+            to_address: Address that was blocked
+            reason: Why it was blocked
+            tx_value_wei: Transaction value in wei
+            **metadata: Additional context
+        """
+        await self.log_event(
+            event_type=AuditEventType.CONTRACT_WHITELIST_BLOCK,
+            severity=AuditSeverity.WARNING,
+            message=f"Transaction blocked by whitelist: {reason}",
+            metadata={
+                "to_address": to_address,
+                "reason": reason,
+                "tx_value_wei": tx_value_wei,
+                **metadata,
+            },
+        )
+
+    async def log_tier_event(
+        self,
+        tier: str,
+        event_type: str,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Log a wallet tier-related event.
+
+        Args:
+            tier: Wallet tier (hot, warm, cold)
+            event_type: Type of tier event (paused, resumed, changed)
+            details: Additional event details
+        """
+        event_type_map = {
+            "paused": AuditEventType.HOT_WALLET_PAUSED,
+            "resumed": AuditEventType.HOT_WALLET_RESUMED,
+            "changed": AuditEventType.WALLET_TIER_CHANGE,
+            "timeout": AuditEventType.APPROVAL_TIMEOUT,
+            "limit_breach": AuditEventType.SPENDING_LIMIT_BREACH,
+        }
+
+        severity_map = {
+            "paused": AuditSeverity.WARNING,
+            "resumed": AuditSeverity.INFO,
+            "changed": AuditSeverity.WARNING,
+            "timeout": AuditSeverity.WARNING,
+            "limit_breach": AuditSeverity.ERROR,
+        }
+
+        await self.log_event(
+            event_type=event_type_map.get(event_type, AuditEventType.WALLET_TIER_CHANGE),
+            severity=severity_map.get(event_type, AuditSeverity.INFO),
+            message=f"Wallet tier event: {tier} wallet {event_type}",
+            metadata={
+                "tier": tier,
+                "event": event_type,
+                **(details or {}),
+            },
+        )
+
+    async def log_validation_failed(
+        self,
+        to_address: str,
+        reason: str,
+        threats: Optional[list] = None,
+        **metadata: Any,
+    ) -> None:
+        """Log a failed transaction validation.
+
+        Args:
+            to_address: Target address
+            reason: Rejection reason
+            threats: List of detected threats
+            **metadata: Additional context
+        """
+        await self.log_event(
+            event_type=AuditEventType.VALIDATION_FAILED,
+            severity=AuditSeverity.WARNING,
+            message=f"Transaction validation failed: {reason}",
+            metadata={
+                "to_address": to_address,
+                "rejection_reason": reason,
+                "threats": threats or [],
+                **metadata,
+            },
+        )
+
+    async def log_spending_limit_breach(
+        self,
+        tier: str,
+        limit_type: str,
+        limit_value: float,
+        attempted_value: float,
+        current_spent: float,
+        auto_paused: bool = False,
+    ) -> None:
+        """Log a spending limit breach.
+
+        Args:
+            tier: Wallet tier
+            limit_type: Type of limit (transaction, daily, weekly)
+            limit_value: The limit that was breached
+            attempted_value: Value that was attempted
+            current_spent: Amount already spent in period
+            auto_paused: Whether wallet was auto-paused
+        """
+        await self.log_event(
+            event_type=AuditEventType.SPENDING_LIMIT_BREACH,
+            severity=AuditSeverity.ERROR,
+            message=f"Spending limit breach: {tier} wallet {limit_type} limit exceeded",
+            metadata={
+                "tier": tier,
+                "limit_type": limit_type,
+                "limit_value_usd": limit_value,
+                "attempted_value_usd": attempted_value,
+                "current_spent_usd": current_spent,
+                "auto_paused": auto_paused,
             },
         )
