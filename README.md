@@ -17,6 +17,74 @@ Built for the emerging agent economy with security and autonomy as top prioritie
 
 ## ✨ Recent Achievements
 
+### Phase 4 Sprint 5: Idle Capital Deployment ✅ COMPLETE (Dec 2025)
+
+**Optimizer now detects and deploys idle capital automatically!** 💰
+
+#### What's New
+- ✅ **Idle Capital Detection**: Automatically detects USDC sitting idle in wallet
+- ✅ **Best Yield Discovery**: Scans all protocols to find highest APY
+- ✅ **Profitability Validation**: Checks deployment makes sense after gas costs
+- ✅ **Autonomous Deployment**: Creates initial positions without manual intervention
+- ✅ **Comprehensive Logging**: Full audit trail of deployment decisions
+
+#### How It Works
+1. **Detection**: Optimizer checks for idle USDC (minimum $10) when no positions exist
+2. **Scanning**: Finds best yield opportunity across Aave, Moonwell, Morpho, Aerodrome
+3. **Validation**: Profitability calculator ensures deployment beats gas costs
+4. **Execution**: Creates deposit transaction (`from_protocol=None` → target protocol)
+5. **Tracking**: Records new position in database for future rebalancing
+
+#### Example Flow
+```
+💰 Detected idle capital: 100 USDC
+📊 Best opportunity: Moonwell @ 4.48% APY
+✅ Deployment profitable: $4.48/year, break-even in 40 days
+🚀 Deploying 100 USDC → Moonwell
+✅ Deployment successful! Gas: $0.50
+```
+
+#### Before vs After
+| Before | After |
+|--------|-------|
+| ⚠️ No positions → exits early | 💰 No positions → checks for idle capital |
+| Idle USDC earns 0% | Idle USDC deployed to best yield |
+| Manual deployment required | Fully autonomous |
+
+---
+
+### Phase 4 Sprint 4: Tiered Wallet Security ✅ COMPLETE (Dec 2025)
+
+**Production-ready three-tier wallet security architecture with attack detection!** 🔐
+
+#### What's New
+- ✅ **Three-Tier Wallets**: HOT (autonomous), WARM (manual approval), COLD (hardware)
+- ✅ **Attack Detection**: EIP-7702 delegation and Permit2 hidden approval detection
+- ✅ **Contract Whitelist**: 10+ Base protocols whitelisted (USDC, Aave, Moonwell, etc.)
+- ✅ **Auto-Pause**: Hot wallet pauses itself on spending limit breach
+- ✅ **Approval Server**: FastAPI dashboard for manual approval management
+- ✅ **Event-Driven**: No polling - instant approval response
+
+#### Wallet Tiers
+
+| Tier | Max TX | Daily | Approval | Use Case |
+|------|--------|-------|----------|----------|
+| HOT | $500 | $1,000 | None (auto) | Day-to-day operations |
+| WARM | $5,000 | $10,000 | 24h manual | Larger transactions |
+| COLD | Unlimited | Unlimited | 168h hardware | Treasury operations |
+
+#### Security Features
+- **EIP-7702 Detection**: Blocks delegation authorization attacks
+- **Permit2 Monitoring**: Detects hidden token approvals
+- **Dangerous Functions**: Blocks selfdestruct, delegatecall, upgradeTo
+- **Whitelist Enforcement**: Only known contracts allowed
+
+#### Documentation
+- [`docs/security.md`](docs/security.md) - Complete security architecture
+- [`NEXT_SESSION_WALLET_SECURITY.md`](NEXT_SESSION_WALLET_SECURITY.md) - Implementation details
+
+---
+
 ### Phase 3 Sprint 3: Complete Optimization Engine ✅ COMPLETE (Nov 2025)
 
 **Production-ready decision-making system with profitability validation and risk assessment!** 🚀
