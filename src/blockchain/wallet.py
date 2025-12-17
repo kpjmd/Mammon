@@ -227,7 +227,7 @@ class WalletManager:
                 from src.utils.constants import TOKEN_ADDRESSES
 
                 web3 = get_web3(self.network)
-                wallet_address = self.wallet_provider.default_address.address_id
+                wallet_address = self.address
 
                 # Get USDC contract address based on network
                 network = web3.eth.chain_id
