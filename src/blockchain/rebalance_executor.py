@@ -24,6 +24,8 @@ from src.protocols.uniswap_v3_router import UniswapV3Router
 from src.strategies.base_strategy import RebalanceRecommendation
 from src.security.audit import AuditLogger, AuditEventType, AuditSeverity
 from src.security.limits import SpendingLimits
+from src.data.database import Database, BaseRepository
+from src.data.models import Transaction
 from src.data.oracles import PriceOracle
 from src.utils.logger import get_logger
 
@@ -132,6 +134,7 @@ class RebalanceExecutor:
         price_oracle: PriceOracle,
         config: Dict[str, Any],
         swap_router: Optional[UniswapV3Router] = None,
+        database: Optional[Database] = None,
     ) -> None:
         """Initialize the rebalance executor.
 
@@ -142,6 +145,8 @@ class RebalanceExecutor:
             price_oracle: PriceOracle for USD conversions
             config: Configuration dictionary
             swap_router: Optional UniswapV3Router for swaps
+            database: Optional database for persisting real (non-dry-run)
+                transaction history
         """
         self.wallet = wallet_manager
         self.protocol_executor = protocol_executor
@@ -151,6 +156,7 @@ class RebalanceExecutor:
         self.config = config
         self.audit_logger = AuditLogger()
         self.spending_limits = SpendingLimits(config)
+        self.database = database
 
         self.simulate_before_execute = config.get("simulate_before_execute", True)
         self.dry_run_mode = config.get("dry_run_mode", True)
@@ -333,9 +339,53 @@ class RebalanceExecutor:
             )
 
             logger.error(f"❌ Rebalance execution failed: {e}")
+            await self._persist_transactions(recommendation, execution)
             raise
 
+        await self._persist_transactions(recommendation, execution)
         return execution
+
+    async def _persist_transactions(
+        self,
+        recommendation: RebalanceRecommendation,
+        execution: RebalanceExecution,
+    ) -> None:
+        """Write a Transaction row for each real on-chain step.
+
+        This is what gives `scripts/daily_check.py` and direct SQL queries
+        real, verifiable transaction history instead of only a text
+        audit.log. No-op if no database is configured, or for steps with
+        no tx_hash (e.g. VALIDATION/BALANCE_CHECK/VERIFICATION, which don't
+        submit a transaction).
+
+        Args:
+            recommendation: The recommendation that was executed
+            execution: The completed (or failed) execution
+        """
+        if self.database is None:
+            return
+
+        try:
+            async with self.database.get_session() as session:
+                repo = BaseRepository(session, Transaction)
+                for step in execution.steps:
+                    if not step.tx_hash:
+                        continue
+
+                    repo.create(
+                        tx_hash=step.tx_hash,
+                        from_protocol=recommendation.from_protocol,
+                        to_protocol=recommendation.to_protocol,
+                        operation=step.step.value,
+                        token=recommendation.token,
+                        amount=recommendation.amount,
+                        gas_used=step.gas_used,
+                        status="completed" if step.success else "failed",
+                        error_message=step.error,
+                        completed_at=step.timestamp,
+                    )
+        except Exception as e:
+            logger.error(f"Failed to persist transaction history: {e}", exc_info=True)
 
     async def _validate_recommendation(
         self,

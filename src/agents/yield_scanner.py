@@ -399,7 +399,11 @@ class YieldScannerAgent:
             "better_opportunities_count": len(better_opportunities),
         }
 
-    async def find_best_yield(self, token: str) -> Optional[YieldOpportunity]:
+    async def find_best_yield(
+        self,
+        token: str,
+        protocol_allowlist: Optional[List[str]] = None,
+    ) -> Optional[YieldOpportunity]:
         """Find the highest yield for a specific token across all protocols.
 
         This is the CORE VALUE PROPOSITION: Find the absolute best yield
@@ -407,6 +411,12 @@ class YieldScannerAgent:
 
         Args:
             token: Token symbol to search for (e.g., 'USDC', 'WETH')
+            protocol_allowlist: If given, only consider protocols in this
+                list. Protocols are scanned even when their deposit/withdraw
+                execution isn't implemented yet (e.g. Morpho) — callers that
+                will actually execute a deposit must restrict to protocols
+                with working execution, or this can recommend a protocol
+                that fails at execution time.
 
         Returns:
             YieldOpportunity with highest APY for the token, or None if not found
@@ -422,6 +432,11 @@ class YieldScannerAgent:
             for opp in all_opportunities
             if token.upper() in [t.upper() for t in opp.tokens]
         ]
+
+        if protocol_allowlist is not None:
+            token_opportunities = [
+                opp for opp in token_opportunities if opp.protocol in protocol_allowlist
+            ]
 
         if not token_opportunities:
             logger.warning(f"No {token} opportunities found across any protocol")

@@ -384,6 +384,47 @@ async def test_optimizer_no_profitable_moves(mock_scanner, simple_yield_strategy
     assert isinstance(recommendations, list), "Should return a list"
 
 
+def test_build_yields_dictionary_filters_by_target_token(mock_scanner, simple_yield_strategy):
+    """Regression test: yield comparison must not leak a protocol's APY
+    from an unrelated token's pool (e.g. WETH) into a USDC comparison.
+
+    Before the fix, _build_yields_dictionary took the highest APY per
+    protocol across ALL tokens, so a protocol's WETH pool could outrank
+    its USDC pool and get compared against a USDC position.
+    """
+    optimizer = OptimizerAgent(
+        config={"dry_run_mode": True},
+        scanner=mock_scanner,
+        strategy=simple_yield_strategy,
+    )
+    assert optimizer.target_token == "USDC"
+
+    opportunities = [
+        YieldOpportunity(
+            protocol="Aave V3",
+            pool_id="usdc-pool",
+            pool_name="USDC Pool",
+            apy=Decimal("5.0"),
+            tvl=Decimal("100_000_000"),
+            tokens=["USDC"],
+        ),
+        # Same protocol, much higher APY, but a different token -
+        # must NOT be selected as Aave V3's yield for USDC comparisons.
+        YieldOpportunity(
+            protocol="Aave V3",
+            pool_id="weth-pool",
+            pool_name="WETH Pool",
+            apy=Decimal("25.0"),
+            tvl=Decimal("50_000_000"),
+            tokens=["WETH"],
+        ),
+    ]
+
+    yields_dict = optimizer._build_yields_dictionary(opportunities)
+
+    assert yields_dict == {"Aave V3": Decimal("5.0")}
+
+
 @pytest.mark.asyncio
 async def test_optimizer_strategy_comparison(mock_scanner, simple_yield_strategy, risk_adjusted_strategy):
     """Compare SimpleYield vs RiskAdjusted on same data.

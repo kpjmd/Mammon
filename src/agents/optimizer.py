@@ -56,6 +56,7 @@ class OptimizerAgent:
         self.strategy = strategy
         self.audit_logger = AuditLogger()
         self.dry_run_mode = config.get("dry_run_mode", True)
+        self.target_token = config.get("target_token", "USDC")
 
         logger.info(
             f"OptimizerAgent initialized with strategy: {strategy.name}"
@@ -282,19 +283,32 @@ class OptimizerAgent:
     ) -> Dict[str, Decimal]:
         """Convert YieldOpportunity list to protocol->APY dictionary.
 
-        Takes the highest APY for each protocol (across all pools).
+        Takes the highest APY for each protocol, considering only pools
+        for `self.target_token` — current_positions/recommendations are
+        single-token (USDC by default), so comparing against a protocol's
+        APY on an unrelated token (e.g. its WETH pool) would be invalid.
 
         Args:
             opportunities: List of YieldOpportunity objects from scanner
 
         Returns:
-            Dict mapping protocol name to best APY
+            Dict mapping protocol name to best APY for the target token
             Example: {"Aave V3": Decimal("5.5"), "Morpho": Decimal("7.2")}
         """
         logger.info(f"🔍 DEBUG: _build_yields_dictionary() called with {len(opportunities)} opportunities")
         yields_dict: Dict[str, Decimal] = {}
 
-        for i, opp in enumerate(opportunities):
+        target_opportunities = [
+            opp
+            for opp in opportunities
+            if self.target_token.upper() in [t.upper() for t in opp.tokens]
+        ]
+        logger.info(
+            f"🔍 DEBUG: {len(target_opportunities)}/{len(opportunities)} opportunities "
+            f"match target token '{self.target_token}'"
+        )
+
+        for i, opp in enumerate(target_opportunities):
             protocol = opp.protocol
             apy = opp.apy
 

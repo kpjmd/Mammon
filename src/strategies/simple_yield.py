@@ -58,6 +58,11 @@ class SimpleYieldStrategy(BaseStrategy):
             "min_rebalance_amount", Decimal("100")
         )  # $100 minimum
 
+        # Single-token scope: current_positions/available_yields passed in
+        # are expected to already be filtered to this token (see
+        # OptimizerAgent.target_token / ScheduledOptimizer.target_token).
+        self.target_token = config.get("target_token", "USDC")
+
         # Protocol whitelist (only fully implemented protocols)
         # TODO: Implement approval/deposit for: Aerodrome, Morpho
         self.supported_protocols = config.get(
@@ -160,11 +165,10 @@ class SimpleYieldStrategy(BaseStrategy):
 
             if profitability.is_profitable:
                 # Create recommendation
-                # TODO: Get actual token from position data instead of hardcoding USDC
                 recommendation = RebalanceRecommendation(
                     from_protocol=current_protocol,
                     to_protocol=best_protocol,
-                    token="USDC",  # TODO: Should come from position data
+                    token=self.target_token,
                     amount=position_amount,
                     expected_apy=best_apy,
                     current_apy=current_apy,

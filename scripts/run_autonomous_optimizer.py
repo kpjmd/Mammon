@@ -228,6 +228,7 @@ class AutonomousRunner:
             gas_estimator=gas_estimator,
             price_oracle=oracle,
             config=config,
+            database=database,
         )
         audit_logger = AuditLogger()
         logger.info("✅ STEP 9: Executors created successfully")

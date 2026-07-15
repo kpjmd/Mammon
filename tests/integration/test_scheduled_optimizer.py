@@ -230,7 +230,7 @@ class TestScheduledOptimizer:
             with patch.object(
                 scheduled_optimizer,
                 "_is_profitable",
-                new=AsyncMock(return_value=True),
+                new=AsyncMock(return_value=(True, [])),
             ):
                 # Run single cycle
                 executions = await scheduled_optimizer.run_once()
@@ -275,7 +275,7 @@ class TestScheduledOptimizer:
             with patch.object(
                 scheduled_optimizer,
                 "_is_profitable",
-                new=AsyncMock(return_value=True),
+                new=AsyncMock(return_value=(True, [])),
             ):
                 # Run cycle
                 executions = await scheduled_optimizer.run_once()
@@ -312,7 +312,7 @@ class TestScheduledOptimizer:
             with patch.object(
                 scheduled_optimizer,
                 "_is_profitable",
-                new=AsyncMock(return_value=False),
+                new=AsyncMock(return_value=(False, ["unprofitable"])),
             ):
                 # Run cycle
                 executions = await scheduled_optimizer.run_once()
@@ -373,7 +373,7 @@ class TestScheduledOptimizer:
             with patch.object(
                 scheduled_optimizer,
                 "_is_profitable",
-                new=AsyncMock(return_value=True),
+                new=AsyncMock(return_value=(True, [])),
             ):
                 # Override scan interval to 0.1 hours (6 minutes) for fast testing
                 scheduled_optimizer.scan_interval_hours = 0.01  # 36 seconds
@@ -392,6 +392,146 @@ class TestScheduledOptimizer:
                 logger.info(f"Total scans: {scheduled_optimizer.status.total_scans}")
 
         logger.info("✅ Scheduled execution test passed!")
+
+    @pytest.mark.asyncio
+    async def test_is_profitable_rejects_recommendation_without_current_apy(
+        self, scheduled_optimizer
+    ):
+        """Regression test: _is_profitable must not fall back to a
+        hardcoded placeholder APY when current_apy is unset - it should
+        reject rather than guess.
+        """
+        from src.strategies.base_strategy import RebalanceRecommendation
+
+        recommendation = RebalanceRecommendation(
+            from_protocol="Moonwell",
+            to_protocol="Aave V3",
+            token="USDC",
+            amount=Decimal("1000"),
+            expected_apy=Decimal("8.5"),
+            reason="Test opportunity",
+            confidence=85,
+            current_apy=None,
+        )
+
+        is_profitable, reasons = await scheduled_optimizer._is_profitable(recommendation)
+
+        assert is_profitable is False
+        assert reasons
+
+    @pytest.mark.asyncio
+    async def test_is_profitable_uses_recommendation_current_apy(
+        self, scheduled_optimizer
+    ):
+        """Regression test: _is_profitable must use the recommendation's
+        real current_apy, not the old hardcoded Decimal("3.5") placeholder.
+        """
+        from src.strategies.base_strategy import RebalanceRecommendation
+
+        recommendation = RebalanceRecommendation(
+            from_protocol="Moonwell",
+            to_protocol="Aave V3",
+            token="USDC",
+            amount=Decimal("1000"),
+            expected_apy=Decimal("8.5"),
+            reason="Test opportunity",
+            confidence=85,
+            current_apy=Decimal("1.0"),
+        )
+
+        with patch.object(
+            scheduled_optimizer.profitability_calc,
+            "calculate_profitability",
+            new=AsyncMock(wraps=scheduled_optimizer.profitability_calc.calculate_profitability),
+        ) as mock_calc:
+            await scheduled_optimizer._is_profitable(recommendation)
+
+            mock_calc.assert_awaited_once()
+            _, kwargs = mock_calc.call_args
+            assert kwargs["current_apy"] == Decimal("1.0")
+            assert kwargs["current_apy"] != Decimal("3.5")
+
+    @pytest.mark.asyncio
+    async def test_decision_persisted_on_rejection_and_approval(
+        self,
+        config,
+        yield_scanner,
+        optimizer,
+        risk_assessor,
+        rebalance_executor,
+        wallet_manager,
+        profitability_calc,
+    ):
+        """Regression test: gate outcomes must be written to the Decision
+        table so scripts/daily_check.py's gate-rejection stats are real
+        instead of always reporting 0/0/0/0.
+        """
+        from src.strategies.base_strategy import RebalanceRecommendation
+        from src.data.database import Database
+        from src.data.models import Decision
+
+        database = Database("sqlite:///:memory:")
+        database.create_all_tables()
+
+        audit_logger = AuditLogger(log_file="test_audit.log")
+        scheduler = ScheduledOptimizer(
+            config=config,
+            yield_scanner=yield_scanner,
+            optimizer=optimizer,
+            risk_assessor=risk_assessor,
+            rebalance_executor=rebalance_executor,
+            wallet_manager=wallet_manager,
+            profitability_calc=profitability_calc,
+            audit_logger=audit_logger,
+            database=database,
+        )
+
+        rejected_rec = RebalanceRecommendation(
+            from_protocol="Moonwell",
+            to_protocol="Aave V3",
+            token="USDC",
+            amount=Decimal("1000"),
+            expected_apy=Decimal("8.5"),
+            reason="Rejected opportunity",
+            confidence=85,
+            current_apy=Decimal("8.0"),
+        )
+        approved_rec = RebalanceRecommendation(
+            from_protocol="Moonwell",
+            to_protocol="Aave V3",
+            token="USDC",
+            amount=Decimal("1000"),
+            expected_apy=Decimal("8.5"),
+            reason="Approved opportunity",
+            confidence=85,
+            current_apy=Decimal("2.0"),
+        )
+
+        with patch.object(
+            scheduler.optimizer,
+            "find_rebalance_opportunities",
+            new=AsyncMock(return_value=[rejected_rec, approved_rec]),
+        ):
+            with patch.object(
+                scheduler,
+                "_is_profitable",
+                new=AsyncMock(
+                    side_effect=[(False, ["Net gain below minimum"]), (True, [])]
+                ),
+            ):
+                await scheduler.run_once()
+
+        async with database.get_session() as session:
+            decisions = session.query(Decision).all()
+
+        assert len(decisions) == 2
+        rejected = [d for d in decisions if d.approved == -1]
+        approved = [d for d in decisions if d.approved == 1]
+        assert len(rejected) == 1
+        assert "Net gain below minimum" in rejected[0].rationale
+        assert len(approved) == 1
+
+        logger.info("✅ Decision persistence test passed!")
 
 
 # Run tests with: pytest tests/integration/test_scheduled_optimizer.py -v

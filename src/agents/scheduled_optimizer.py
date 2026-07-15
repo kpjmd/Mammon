@@ -10,7 +10,7 @@ Designed for autonomous operation with configurable scheduling,
 safety limits, and error recovery.
 """
 
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime, UTC, timedelta
 from decimal import Decimal
 import asyncio
@@ -22,7 +22,8 @@ from src.strategies.base_strategy import RebalanceRecommendation
 from src.strategies.profitability_calculator import ProfitabilityCalculator
 from src.blockchain.rebalance_executor import RebalanceExecutor, RebalanceExecution
 from src.blockchain.wallet import WalletManager
-from src.data.database import Database
+from src.data.database import Database, BaseRepository
+from src.data.models import Decision
 from src.security.audit import AuditLogger, AuditEventType, AuditSeverity
 from src.utils.logger import get_logger
 
@@ -129,6 +130,7 @@ class ScheduledOptimizer:
         self.max_gas_per_day_usd = config.get("max_gas_per_day_usd", Decimal("50"))
         self.min_profit_usd = config.get("min_profit_usd", Decimal("10"))
         self.dry_run_mode = config.get("dry_run_mode", False)
+        self.target_token = config.get("target_token", "USDC")
 
         # State
         self.status = SchedulerStatus()
@@ -315,15 +317,70 @@ class ScheduledOptimizer:
                     self.status.total_opportunities_skipped += len(recommendations) - len(executions)
                     break
 
+                apy_improvement = (
+                    (rec.expected_apy - rec.current_apy)
+                    if rec.current_apy is not None
+                    else None
+                )
+
                 # Check profitability
                 logger.info(f"🔍 SCAN STEP 5.{i}a: Checking profitability...")
-                if not await self._is_profitable(rec):
+                is_profitable, rejection_reasons = await self._is_profitable(rec)
+                if not is_profitable:
                     logger.info(f"Skipping unprofitable recommendation: {rec.reason}")
                     self.status.total_opportunities_skipped += 1
+                    await self._record_decision(
+                        decision_type="rebalance",
+                        rationale="; ".join(rejection_reasons) or "Unprofitable",
+                        from_protocol=rec.from_protocol,
+                        to_protocol=rec.to_protocol,
+                        approved=-1,
+                        expected_apy_improvement=apy_improvement,
+                    )
+                    continue
+
+                # Check risk (CRITICAL always blocks, HIGH blocks unless
+                # explicitly allowed via config)
+                logger.info(f"🔍 SCAN STEP 5.{i}a2: Checking risk...")
+                risk_assessment = await self.risk_assessor.assess_rebalance_risk(
+                    from_protocol=rec.from_protocol,
+                    to_protocol=rec.to_protocol,
+                    amount=rec.amount,
+                    requires_swap=False,
+                )
+                if not self.risk_assessor.should_proceed(
+                    risk_assessment,
+                    allow_high_risk=self.config.get("allow_high_risk", False),
+                ):
+                    logger.warning(
+                        f"Skipping recommendation blocked by risk assessment "
+                        f"({risk_assessment.risk_level.value}): "
+                        f"{rec.from_protocol} → {rec.to_protocol}"
+                    )
+                    self.status.total_opportunities_skipped += 1
+                    await self._record_decision(
+                        decision_type="rebalance",
+                        rationale=f"Blocked by risk assessment: {risk_assessment.recommendation}",
+                        from_protocol=rec.from_protocol,
+                        to_protocol=rec.to_protocol,
+                        approved=-1,
+                        expected_apy_improvement=apy_improvement,
+                        risk_score=risk_assessment.risk_score,
+                    )
                     continue
 
                 # Execute rebalance
                 logger.info(f"🔍 SCAN STEP 5.{i}b: Executing rebalance: {rec.from_protocol} → {rec.to_protocol}")
+
+                await self._record_decision(
+                    decision_type="rebalance",
+                    rationale=rec.reason,
+                    from_protocol=rec.from_protocol,
+                    to_protocol=rec.to_protocol,
+                    approved=1,
+                    expected_apy_improvement=apy_improvement,
+                    risk_score=risk_assessment.risk_score,
+                )
 
                 try:
                     execution = await self.rebalance_executor.execute_rebalance(rec)
@@ -389,8 +446,17 @@ class ScheduledOptimizer:
                 for i, pos in enumerate(active_positions):
                     logger.info(f"🔍 DEBUG: Position {i+1}: protocol={pos.protocol}, value_usd={pos.value_usd}, token={pos.token}")
 
-                # Aggregate by protocol
+                # Aggregate by protocol, restricted to target_token — a
+                # non-target-token position can't be compared against
+                # available_yields (which is also filtered to target_token)
+                # or rebalanced by strategies that only emit target_token
+                # recommendations.
+                skipped = 0
                 for pos in active_positions:
+                    if pos.token.upper() != self.target_token.upper():
+                        skipped += 1
+                        continue
+
                     protocol = pos.protocol
                     value_usd = pos.value_usd
 
@@ -398,6 +464,12 @@ class ScheduledOptimizer:
                         positions[protocol] += value_usd
                     else:
                         positions[protocol] = value_usd
+
+                if skipped:
+                    logger.info(
+                        f"Skipped {skipped} position(s) not in target token "
+                        f"'{self.target_token}'"
+                    )
 
                 logger.info(f"✅ Detected {len(active_positions)} positions, aggregated to: {positions}")
                 return positions
@@ -438,22 +510,34 @@ class ScheduledOptimizer:
 
         return idle_capital
 
-    async def _is_profitable(self, recommendation: RebalanceRecommendation) -> bool:
+    async def _is_profitable(
+        self, recommendation: RebalanceRecommendation
+    ) -> Tuple[bool, List[str]]:
         """Check if recommendation meets profitability criteria.
 
         Args:
             recommendation: RebalanceRecommendation to evaluate
 
         Returns:
-            True if profitable, False otherwise
+            Tuple of (is_profitable, reasons) - reasons explain the gate
+            outcome (rejection reasons if unprofitable, empty if profitable)
         """
         try:
             # Calculate profitability metrics
-            # TODO: Get current APY from database/position tracker
-            current_apy = Decimal("3.5")  # Placeholder - should match Aave USDC
+            current_apy = recommendation.current_apy
+            if current_apy is None:
+                reason = (
+                    f"Recommendation for {recommendation.from_protocol} → "
+                    f"{recommendation.to_protocol} has no current_apy set; "
+                    "treating as unprofitable rather than guessing."
+                )
+                logger.warning(reason)
+                return False, [reason]
 
-            # Check if swap is required (different tokens)
-            requires_swap = recommendation.token != recommendation.token  # Same token for now
+            # RebalanceRecommendation only carries a single `token` field, so
+            # a recommendation can never represent a cross-token move. Swaps
+            # are unsupported end-to-end (see RebalanceExecutor._requires_swap).
+            requires_swap = False
 
             analysis = await self.profitability_calc.calculate_profitability(
                 current_apy=current_apy,
@@ -468,17 +552,17 @@ class ScheduledOptimizer:
                 logger.info(
                     f"Unprofitable: {', '.join(analysis.rejection_reasons)}"
                 )
-                return False
+                return False, analysis.rejection_reasons
 
             logger.info(
                 f"✅ Profitable: ${analysis.annual_gain_usd}/year, "
                 f"break-even in {analysis.break_even_days} days"
             )
-            return True
+            return True, []
 
         except Exception as e:
             logger.error(f"Error checking profitability: {e}", exc_info=True)
-            return False
+            return False, [f"Error checking profitability: {e}"]
 
     async def _is_deployment_profitable(
         self, recommendation: RebalanceRecommendation
@@ -521,6 +605,48 @@ class ScheduledOptimizer:
             logger.error(f"Error checking deployment profitability: {e}", exc_info=True)
             return False
 
+    async def _record_decision(
+        self,
+        decision_type: str,
+        rationale: str,
+        from_protocol: Optional[str],
+        to_protocol: Optional[str],
+        approved: int,
+        expected_apy_improvement: Optional[Decimal] = None,
+        risk_score: Optional[Decimal] = None,
+    ) -> None:
+        """Persist an optimization decision for auditability.
+
+        This is what makes `scripts/daily_check.py`'s gate-rejection stats
+        real instead of always reporting zero. No-op if no database is
+        configured (e.g. in unit tests).
+
+        Args:
+            decision_type: Category of decision (e.g. "rebalance", "idle_deployment")
+            rationale: Human-readable explanation of the outcome
+            from_protocol: Source protocol, if any
+            to_protocol: Target protocol
+            approved: 1=approved, -1=rejected, 0=pending (see Decision model)
+            expected_apy_improvement: APY delta driving the decision, if known
+            risk_score: Risk score from RiskAssessorAgent, if computed
+        """
+        if self.database is None:
+            return
+
+        try:
+            async with self.database.get_session() as session:
+                BaseRepository(session, Decision).create(
+                    decision_type=decision_type,
+                    rationale=rationale,
+                    from_protocol=from_protocol,
+                    to_protocol=to_protocol,
+                    expected_apy_improvement=expected_apy_improvement,
+                    risk_score=int(risk_score) if risk_score is not None else None,
+                    approved=approved,
+                )
+        except Exception as e:
+            logger.error(f"Failed to record decision: {e}", exc_info=True)
+
     async def _deploy_idle_capital(
         self, idle_capital: Dict[str, Decimal]
     ) -> List[RebalanceExecution]:
@@ -534,10 +660,18 @@ class ScheduledOptimizer:
         """
         executions: List[RebalanceExecution] = []
 
+        # Only deploy to protocols the strategy actually supports execution
+        # for — the scanner also returns protocols like Morpho that are
+        # scanned for yield comparison but whose deposit/withdraw isn't
+        # implemented yet, and would fail at execution time.
+        protocol_allowlist = getattr(self.optimizer.strategy, "supported_protocols", None)
+
         for token, amount in idle_capital.items():
             try:
                 # Find best yield for this token
-                best_opportunity = await self.yield_scanner.find_best_yield(token)
+                best_opportunity = await self.yield_scanner.find_best_yield(
+                    token, protocol_allowlist=protocol_allowlist
+                )
 
                 if not best_opportunity:
                     logger.warning(f"No yield opportunity found for {token}")
@@ -570,7 +704,54 @@ class ScheduledOptimizer:
                 if not await self._is_deployment_profitable(recommendation):
                     logger.info("Skipping deployment - not profitable after gas costs")
                     self.status.total_opportunities_skipped += 1
+                    await self._record_decision(
+                        decision_type="idle_deployment",
+                        rationale="Unprofitable after gas costs",
+                        from_protocol=None,
+                        to_protocol=best_opportunity.protocol,
+                        approved=-1,
+                        expected_apy_improvement=best_opportunity.apy,
+                    )
                     continue
+
+                # Check risk (CRITICAL always blocks, HIGH blocks unless
+                # explicitly allowed via config)
+                risk_assessment = await self.risk_assessor.assess_rebalance_risk(
+                    from_protocol=None,
+                    to_protocol=best_opportunity.protocol,
+                    amount=amount,
+                    requires_swap=False,
+                )
+                if not self.risk_assessor.should_proceed(
+                    risk_assessment,
+                    allow_high_risk=self.config.get("allow_high_risk", False),
+                ):
+                    logger.warning(
+                        f"Skipping deployment blocked by risk assessment "
+                        f"({risk_assessment.risk_level.value}): "
+                        f"{token} → {best_opportunity.protocol}"
+                    )
+                    self.status.total_opportunities_skipped += 1
+                    await self._record_decision(
+                        decision_type="idle_deployment",
+                        rationale=f"Blocked by risk assessment: {risk_assessment.recommendation}",
+                        from_protocol=None,
+                        to_protocol=best_opportunity.protocol,
+                        approved=-1,
+                        expected_apy_improvement=best_opportunity.apy,
+                        risk_score=risk_assessment.risk_score,
+                    )
+                    continue
+
+                await self._record_decision(
+                    decision_type="idle_deployment",
+                    rationale=recommendation.reason,
+                    from_protocol=None,
+                    to_protocol=best_opportunity.protocol,
+                    approved=1,
+                    expected_apy_improvement=best_opportunity.apy,
+                    risk_score=risk_assessment.risk_score,
+                )
 
                 # Execute deployment
                 logger.info(f"🚀 Deploying {amount} {token} → {best_opportunity.protocol}")
