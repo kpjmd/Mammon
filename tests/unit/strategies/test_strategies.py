@@ -86,7 +86,13 @@ def mock_risk_assessor():
 @pytest.fixture
 def simple_strategy(mock_profitability_calc):
     """Create SimpleYieldStrategy for testing."""
-    config = {"min_apy_improvement": Decimal("0.5"), "min_rebalance_amount": Decimal("100")}
+    config = {
+        "min_apy_improvement": Decimal("0.5"),
+        "min_rebalance_amount": Decimal("100"),
+        # Cover the protocols these tests exercise; otherwise the strategy
+        # defaults to ["Aave V3", "Moonwell"] and filters out Morpho.
+        "supported_protocols": ["Aave V3", "Moonwell", "Morpho"],
+    }
     return SimpleYieldStrategy(config=config, profitability_calc=mock_profitability_calc)
 
 

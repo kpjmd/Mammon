@@ -19,6 +19,8 @@ class TestWalletManagerPriceOracleIntegration:
         return {
             "network": "base-sepolia",
             "dry_run_mode": True,
+            # These tests verify oracle pricing / limit math, not whitelisting.
+            "strict_mode": False,
             "max_transaction_usd": Decimal("1000"),
             "daily_limit_usd": Decimal("5000"),
         }
@@ -168,6 +170,8 @@ class TestPriceOraclePrecision:
         return {
             "network": "base-sepolia",
             "dry_run_mode": True,
+            # These tests verify oracle pricing / limit math, not whitelisting.
+            "strict_mode": False,
             "max_transaction_usd": Decimal("1000"),
             "daily_limit_usd": Decimal("5000"),
         }
@@ -210,6 +214,8 @@ class TestMultiTokenSupport:
         return {
             "network": "base-sepolia",
             "dry_run_mode": True,
+            # These tests verify oracle pricing / limit math, not whitelisting.
+            "strict_mode": False,
             "max_transaction_usd": Decimal("1000"),
             "daily_limit_usd": Decimal("5000"),
         }
@@ -270,6 +276,8 @@ class TestOracleIntegrationEdgeCases:
         return {
             "network": "base-sepolia",
             "dry_run_mode": True,
+            # These tests verify oracle pricing / limit math, not whitelisting.
+            "strict_mode": False,
             "max_transaction_usd": Decimal("1000"),
             "daily_limit_usd": Decimal("5000"),
         }
