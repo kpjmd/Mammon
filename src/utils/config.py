@@ -77,6 +77,148 @@ class Settings(BaseSettings):
         ge=0,
     )
 
+    # Live wallet safety latch (enforced by WalletManager on the running path)
+    wallet_auto_pause: bool = Field(
+        default=True,
+        description=(
+            "Auto-pause the wallet on a cumulative spending-limit breach; "
+            "latches until an operator resumes it"
+        ),
+    )
+    max_wallet_balance_usd: Decimal = Field(
+        default=Decimal("2000"),
+        description=(
+            "Hot-wallet balance cap (USD). Exceeding it emits a WARN alert to "
+            "move excess to cold storage; not enforced as a hard block"
+        ),
+        ge=0,
+    )
+
+    # Circuit breaker (WS3): halt the autonomous loop on repeated cycle failures
+    circuit_breaker_consecutive_failures: int = Field(
+        default=3,
+        description="Consecutive failed cycles that trip the circuit breaker",
+        ge=1,
+        le=20,
+    )
+    circuit_breaker_max_failures_per_day: int = Field(
+        default=10,
+        description="Failed cycles within 24h that trip the circuit breaker",
+        ge=1,
+    )
+    recovery_max_gas_usd: Decimal = Field(
+        default=Decimal("1"),
+        description=(
+            "Max gas (USD) to spend re-deploying stranded funds; recovery "
+            "bypasses the normal minimum-profit gate"
+        ),
+        ge=0,
+    )
+
+    # Monitoring / alerting (WS4)
+    alert_rate_limit_per_hour: int = Field(
+        default=20,
+        description="Max non-critical alerts per rolling hour",
+        ge=1,
+    )
+    heartbeat_file: str = Field(
+        default="data/heartbeat.json",
+        description="Path where the autonomous loop writes its liveness heartbeat",
+    )
+    heartbeat_max_age_seconds: int = Field(
+        default=10800,
+        description="Heartbeat age (s) beyond which the dead-man checker alerts",
+        ge=60,
+    )
+
+    # Tiered Wallet Security Configuration (Phase 5)
+    wallet_tier: str = Field(
+        default="hot",
+        description="Active wallet tier: hot, warm, or cold",
+    )
+
+    # Hot Wallet (Tier 1) Limits
+    hot_wallet_address: Optional[str] = Field(
+        default=None,
+        description="Hot wallet address (public only - seed injected at runtime)",
+    )
+    hot_wallet_max_balance_usd: Decimal = Field(
+        default=Decimal("2000"),
+        description="Maximum balance allowed in hot wallet (USD)",
+        ge=0,
+    )
+    hot_wallet_max_transaction_usd: Decimal = Field(
+        default=Decimal("500"),
+        description="Maximum single transaction for hot wallet (USD)",
+        ge=0,
+    )
+    hot_wallet_daily_limit_usd: Decimal = Field(
+        default=Decimal("1000"),
+        description="Daily spending limit for hot wallet (USD)",
+        ge=0,
+    )
+    hot_wallet_auto_pause: bool = Field(
+        default=True,
+        description=(
+            "DEPRECATED/parked: the tiered HotWalletProvider is not on the live "
+            "path. Use wallet_auto_pause instead (enforced by WalletManager)."
+        ),
+    )
+
+    # Warm Wallet (Tier 2) Limits
+    warm_wallet_address: Optional[str] = Field(
+        default=None,
+        description="Warm wallet address (requires approval for transactions)",
+    )
+    warm_wallet_max_transaction_usd: Decimal = Field(
+        default=Decimal("5000"),
+        description="Maximum single transaction for warm wallet (USD)",
+        ge=0,
+    )
+    warm_wallet_daily_limit_usd: Decimal = Field(
+        default=Decimal("10000"),
+        description="Daily spending limit for warm wallet (USD)",
+        ge=0,
+    )
+    warm_wallet_approval_timeout_hours: int = Field(
+        default=24,
+        description="Hours to wait for warm wallet approval before timeout",
+        ge=1,
+        le=168,
+    )
+
+    # Cold Wallet (Tier 3) - Manual only
+    cold_wallet_address: Optional[str] = Field(
+        default=None,
+        description="Cold wallet address (Ledger - manual operations only)",
+    )
+
+    # Security Features
+    contract_whitelist_strict: bool = Field(
+        default=True,
+        description="Block transactions to non-whitelisted contracts",
+    )
+    eip7702_detection_enabled: bool = Field(
+        default=True,
+        description="Detect and block EIP-7702 delegation attacks",
+    )
+    permit2_detection_enabled: bool = Field(
+        default=True,
+        description="Detect and warn about Permit2 operations",
+    )
+
+    # Approval Server Configuration
+    approval_server_port: int = Field(
+        default=8080,
+        description="Port for web approval dashboard API",
+        ge=1024,
+        le=65535,
+    )
+    approval_server_token: Optional[str] = Field(
+        default=None,
+        description="Bearer token for approval server authentication",
+    )
+
     # Local Wallet Configuration
     use_local_wallet: bool = Field(
         default=True,
@@ -460,6 +602,29 @@ class Settings(BaseSettings):
         if v_upper not in allowed:
             raise ValueError(f"log_level must be one of {allowed}")
         return v_upper
+
+    @field_validator("wallet_tier")
+    @classmethod
+    def validate_wallet_tier(cls, v: str) -> str:
+        """Validate wallet tier value.
+
+        Args:
+            v: Wallet tier value
+
+        Returns:
+            Validated value (lowercase)
+
+        Raises:
+            ValueError: If tier is invalid
+        """
+        allowed = {"hot", "warm", "cold"}
+        v_lower = v.lower()
+        if v_lower not in allowed:
+            raise ValueError(
+                f"wallet_tier must be one of {allowed}. "
+                f"Hot wallet is recommended for autonomous VPS operation."
+            )
+        return v_lower
 
     @field_validator("dry_run_mode")
     @classmethod

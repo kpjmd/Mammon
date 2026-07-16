@@ -4,6 +4,7 @@ This module handles wallet initialization, connection, and management.
 Supports both CDP wallet provider and local wallet provider.
 """
 
+import asyncio
 from typing import Any, Dict, Optional, Union
 from decimal import Decimal
 from datetime import datetime
@@ -31,6 +32,15 @@ from src.utils.config import get_settings
 from src.data.oracles import PriceOracle, create_price_oracle
 
 logger = get_logger(__name__)
+
+
+class WalletPausedError(Exception):
+    """Raised when a transaction is attempted while the wallet is paused.
+
+    The wallet auto-pauses when a cumulative spending limit is breached and
+    latches until an operator explicitly resumes it. This is a fail-safe:
+    once tripped, no further transactions execute without human intervention.
+    """
 
 
 class WalletManager:
@@ -74,7 +84,17 @@ class WalletManager:
         self.network = config.get("network", "base-sepolia")
         self.dry_run_mode = config.get("dry_run_mode", True)
         self.audit_logger = AuditLogger()
-        self.spending_limits = SpendingLimits(config)
+
+        # Auto-pause latch: when a cumulative spending limit is breached the
+        # wallet pauses and blocks all further transactions until an operator
+        # resumes it. Wired into SpendingLimits' breach callback below.
+        self._paused: bool = False
+        self._pause_reason: Optional[str] = None
+        self.auto_pause_enabled: bool = config.get("wallet_auto_pause", True)
+        self.spending_limits = SpendingLimits(
+            config,
+            auto_pause_callback=self._on_limit_breach if self.auto_pause_enabled else None,
+        )
 
         # Initialize transaction validator for security checks (EIP-7702, Permit2, etc.)
         self.transaction_validator = get_transaction_validator(
@@ -428,9 +448,84 @@ class WalletManager:
                 f"Transaction exceeds daily limit: "
                 f"${amount_usd} would exceed ${self.spending_limits.daily_limit_usd}"
             )
+            # A daily-budget breach is a strong "stop spending" signal (distinct
+            # from a merely oversized single proposal, which is just gated) — so
+            # latch the wallet if auto-pause is enabled.
+            if self.auto_pause_enabled:
+                self._on_limit_breach(
+                    f"Daily spending limit reached "
+                    f"(${amount_usd} would exceed ${self.spending_limits.daily_limit_usd})"
+                )
             return False
 
         return True
+
+    def is_paused(self) -> bool:
+        """Return True if the wallet is currently paused."""
+        return self._paused
+
+    def _on_limit_breach(self, reason: str) -> None:
+        """Synchronous SpendingLimits callback: latch the wallet on breach.
+
+        Called from ``atomic_check_and_record`` (race-safe, authoritative path)
+        when a cumulative limit is exceeded. Sets pause state immediately and
+        schedules async audit + alert notifications on a best-effort basis.
+        """
+        if self._paused:
+            return
+        self._paused = True
+        self._pause_reason = reason
+        logger.critical(f"🛑 Wallet AUTO-PAUSED: {reason}")
+        self._schedule_pause_notifications(reason)
+
+    def _schedule_pause_notifications(self, reason: str) -> None:
+        """Fire-and-forget audit + alert for a pause, if an event loop is live."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # No running loop (e.g. sync test) — state is still latched.
+        loop.create_task(self._notify_pause(reason))
+
+    async def _notify_pause(self, reason: str) -> None:
+        """Best-effort pause notifications; never propagates failures."""
+        try:
+            await self.audit_logger.log_event(
+                AuditEventType.HOT_WALLET_PAUSED,
+                AuditSeverity.CRITICAL,
+                f"Wallet paused: {reason}",
+                metadata={"reason": reason, "address": self.address},
+            )
+        except Exception as e:
+            logger.error(f"Pause audit failed: {e}")
+        try:
+            from src.utils.alerts import get_alert_manager
+
+            await get_alert_manager().critical(
+                "Wallet auto-paused", reason, address=self.address
+            )
+        except Exception as e:
+            logger.error(f"Pause alert failed: {e}")
+
+    async def pause(self, reason: str) -> None:
+        """Explicitly pause the wallet (operator/kill-switch)."""
+        self._on_limit_breach(reason)
+
+    async def resume(self) -> None:
+        """Clear the pause latch. Requires a deliberate operator action."""
+        was_paused = self._paused
+        self._paused = False
+        self._pause_reason = None
+        if was_paused:
+            logger.warning("▶️  Wallet RESUMED by operator")
+            try:
+                await self.audit_logger.log_event(
+                    AuditEventType.HOT_WALLET_RESUMED,
+                    AuditSeverity.WARNING,
+                    "Wallet resumed by operator",
+                    metadata={"address": self.address},
+                )
+            except Exception as e:
+                logger.error(f"Resume audit failed: {e}")
 
     async def _convert_to_usd(self, amount: Decimal, token: str = "ETH") -> Decimal:
         """Convert token amount to USD using price oracle.
@@ -845,6 +940,13 @@ class WalletManager:
             raise ValueError(
                 "Cannot execute transaction in dry-run mode. "
                 "Set DRY_RUN_MODE=false in .env to enable real transactions."
+            )
+
+        # Fail-safe: a paused wallet blocks all execution until manual resume.
+        if self._paused:
+            logger.critical(f"🛑 Execution blocked — wallet is paused: {self._pause_reason}")
+            raise WalletPausedError(
+                f"Wallet is paused: {self._pause_reason}. Manual resume required."
             )
 
         if not self.wallet_provider:

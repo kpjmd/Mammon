@@ -5,6 +5,14 @@ Defines three wallet tiers with different security levels:
 - WARM: Manual approval required via web dashboard ($5000/tx)
 - COLD: Hardware wallet (Ledger) - manual only (future)
 
+NOTE: The tiered wallet *providers* (HotWalletProvider / WarmWalletProvider /
+ColdWalletStub) were removed — they were never wired into the live path. The
+two behaviors worth keeping (auto-pause on cumulative-limit breach, hot-balance
+cap) were ported into the live WalletManager + ScheduledOptimizer. This module
+is retained because its config/enum types are still imported by the transaction
+validator, spending limits, and the approval server. Full tier isolation is
+deferred to the planned CDP MPC custody migration.
+
 Security Note: Seed phrases should NEVER be stored in filesystem.
 Use environment variable injection at runtime.
 """
