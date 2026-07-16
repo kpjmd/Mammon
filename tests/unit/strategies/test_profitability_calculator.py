@@ -123,8 +123,19 @@ class TestProfitabilityCalculator:
         assert any("Net gain" in reason for reason in result.rejection_reasons)
 
     @pytest.mark.asyncio
-    async def test_unprofitable_long_breakeven(self, calculator):
-        """Long break-even period → unprofitable."""
+    async def test_unprofitable_long_breakeven(self, mock_gas_estimator):
+        """Long break-even period → unprofitable.
+
+        Uses an Ethereum-level gas estimator (10 gwei, $2500 ETH ≈ several
+        dollars per tx) rather than the Base-L2 fallback (~$0.0075), otherwise
+        the tiny gas can never produce a break-even beyond the 30-day limit.
+        """
+        calculator = ProfitabilityCalculator(
+            min_annual_gain_usd=Decimal("10"),
+            max_break_even_days=30,
+            max_cost_pct=Decimal("0.01"),  # 1%
+            gas_estimator=mock_gas_estimator,
+        )
         result = await calculator.calculate_profitability(
             current_apy=Decimal("4.0"),
             target_apy=Decimal("4.3"),  # +0.3% APY
@@ -132,8 +143,8 @@ class TestProfitabilityCalculator:
             requires_swap=False,
         )
 
-        # Annual gain: $3000 * 0.3% = $9
-        # With ~$5-10 gas, break-even is long
+        # Annual gain: $3000 * 0.3% = $9; with several dollars of gas the
+        # break-even stretches past the 30-day maximum.
         assert result.is_profitable is False
         assert result.break_even_days > 30
         assert any("Break-even" in reason for reason in result.rejection_reasons)

@@ -196,6 +196,8 @@ async def test_get_pools_creates_correct_pool_structure(mock_config):
         mock_atoken_contract.functions.totalSupply.return_value.call.return_value = 1000000 * 10**6  # 1M USDC
 
         def contract_side_effect(address, abi):
+            if address == AAVE_V3_CONTRACTS["base-mainnet"]["pool"]:
+                return mock_pool_contract
             if address == usdc_address:
                 return mock_token_contract
             elif address == atoken_address:

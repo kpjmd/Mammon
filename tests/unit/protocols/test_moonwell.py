@@ -67,18 +67,18 @@ async def test_moonwell_read_only_mode_enforced(mock_config):
 
 
 @pytest.mark.asyncio
-async def test_rate_per_block_to_apy_zero_rate(mock_config):
-    """Test rate per block to APY conversion with zero rate."""
+async def test_rate_per_timestamp_to_apy_zero_rate(mock_config):
+    """Test rate per timestamp to APY conversion with zero rate."""
     with patch("src.protocols.moonwell.get_web3"):
         moonwell = MoonwellProtocol(mock_config)
 
-        apy = moonwell._rate_per_block_to_apy(0)
+        apy = moonwell._rate_per_timestamp_to_apy(0)
         assert apy == Decimal("0")
 
 
 @pytest.mark.asyncio
-async def test_rate_per_block_to_apy_typical_rate(mock_config):
-    """Test rate per block to APY conversion with typical lending rate."""
+async def test_rate_per_timestamp_to_apy_typical_rate(mock_config):
+    """Test rate per timestamp to APY conversion with typical lending rate."""
     with patch("src.protocols.moonwell.get_web3"):
         moonwell = MoonwellProtocol(mock_config)
 
@@ -87,7 +87,7 @@ async def test_rate_per_block_to_apy_typical_rate(mock_config):
         # rate_per_block ≈ 0.05 / (43200 * 365) = ~3.17e-9
         # In 1e18 scale: ~3.17e9
         rate_per_block = int(3.17e9)
-        apy = moonwell._rate_per_block_to_apy(rate_per_block)
+        apy = moonwell._rate_per_timestamp_to_apy(rate_per_block)
 
         # APY should be positive and reasonable
         assert apy > Decimal("0")
@@ -95,14 +95,14 @@ async def test_rate_per_block_to_apy_typical_rate(mock_config):
 
 
 @pytest.mark.asyncio
-async def test_rate_per_block_to_apy_high_rate(mock_config):
-    """Test rate per block to APY conversion with high lending rate."""
+async def test_rate_per_timestamp_to_apy_high_rate(mock_config):
+    """Test rate per timestamp to APY conversion with high lending rate."""
     with patch("src.protocols.moonwell.get_web3"):
         moonwell = MoonwellProtocol(mock_config)
 
         # High rate: ~20% APY
         rate_per_block = int(1.27e10)  # ~20% APY
-        apy = moonwell._rate_per_block_to_apy(rate_per_block)
+        apy = moonwell._rate_per_timestamp_to_apy(rate_per_block)
 
         # APY should be positive
         assert apy > Decimal("0")
@@ -163,13 +163,15 @@ async def test_get_pools_handles_eth_market(mock_config):
 
         # Mock mToken functions (no underlying() for ETH)
         mock_mtoken_contract.functions.underlying.return_value.call.side_effect = Exception("No underlying for ETH")
-        mock_mtoken_contract.functions.supplyRatePerBlock.return_value.call.return_value = int(3e9)
-        mock_mtoken_contract.functions.borrowRatePerBlock.return_value.call.return_value = int(5e9)
+        mock_mtoken_contract.functions.supplyRatePerTimestamp.return_value.call.return_value = int(3e9)
+        mock_mtoken_contract.functions.borrowRatePerTimestamp.return_value.call.return_value = int(5e9)
         mock_mtoken_contract.functions.getCash.return_value.call.return_value = 1000 * 10**18
         mock_mtoken_contract.functions.totalBorrows.return_value.call.return_value = 500 * 10**18
         mock_mtoken_contract.functions.totalReserves.return_value.call.return_value = 50 * 10**18
 
         def contract_side_effect(address, abi):
+            if address == MOONWELL_CONTRACTS["base-mainnet"]["comptroller"]:
+                return mock_comptroller_contract
             if address == meth_address:
                 return mock_mtoken_contract
             return MagicMock()
@@ -202,8 +204,8 @@ async def test_get_pools_creates_correct_pool_structure(mock_config):
 
         # Mock mToken functions
         mock_mtoken_contract.functions.underlying.return_value.call.return_value = usdc_address
-        mock_mtoken_contract.functions.supplyRatePerBlock.return_value.call.return_value = int(3e9)
-        mock_mtoken_contract.functions.borrowRatePerBlock.return_value.call.return_value = int(5e9)
+        mock_mtoken_contract.functions.supplyRatePerTimestamp.return_value.call.return_value = int(3e9)
+        mock_mtoken_contract.functions.borrowRatePerTimestamp.return_value.call.return_value = int(5e9)
         mock_mtoken_contract.functions.getCash.return_value.call.return_value = 1000000 * 10**6
         mock_mtoken_contract.functions.totalBorrows.return_value.call.return_value = 500000 * 10**6
         mock_mtoken_contract.functions.totalReserves.return_value.call.return_value = 50000 * 10**6
@@ -213,6 +215,8 @@ async def test_get_pools_creates_correct_pool_structure(mock_config):
         mock_token_contract.functions.decimals.return_value.call.return_value = 6
 
         def contract_side_effect(address, abi):
+            if address == MOONWELL_CONTRACTS["base-mainnet"]["comptroller"]:
+                return mock_comptroller_contract
             if address == musdc_address:
                 return mock_mtoken_contract
             elif address == usdc_address:
@@ -400,8 +404,8 @@ async def test_utilization_calculation_normal(mock_config):
         reserves = 0
 
         mock_mtoken_contract.functions.underlying.return_value.call.return_value = usdc_address
-        mock_mtoken_contract.functions.supplyRatePerBlock.return_value.call.return_value = int(3e9)
-        mock_mtoken_contract.functions.borrowRatePerBlock.return_value.call.return_value = int(5e9)
+        mock_mtoken_contract.functions.supplyRatePerTimestamp.return_value.call.return_value = int(3e9)
+        mock_mtoken_contract.functions.borrowRatePerTimestamp.return_value.call.return_value = int(5e9)
         mock_mtoken_contract.functions.getCash.return_value.call.return_value = cash
         mock_mtoken_contract.functions.totalBorrows.return_value.call.return_value = borrows
         mock_mtoken_contract.functions.totalReserves.return_value.call.return_value = reserves
@@ -410,6 +414,8 @@ async def test_utilization_calculation_normal(mock_config):
         mock_token_contract.functions.decimals.return_value.call.return_value = 6
 
         def contract_side_effect(address, abi):
+            if address == MOONWELL_CONTRACTS["base-mainnet"]["comptroller"]:
+                return mock_comptroller_contract
             if address == musdc_address:
                 return mock_mtoken_contract
             elif address == usdc_address:
@@ -444,8 +450,8 @@ async def test_utilization_calculation_zero_supply(mock_config):
 
         # Mock zero supply
         mock_mtoken_contract.functions.underlying.return_value.call.return_value = usdc_address
-        mock_mtoken_contract.functions.supplyRatePerBlock.return_value.call.return_value = 0
-        mock_mtoken_contract.functions.borrowRatePerBlock.return_value.call.return_value = 0
+        mock_mtoken_contract.functions.supplyRatePerTimestamp.return_value.call.return_value = 0
+        mock_mtoken_contract.functions.borrowRatePerTimestamp.return_value.call.return_value = 0
         mock_mtoken_contract.functions.getCash.return_value.call.return_value = 0
         mock_mtoken_contract.functions.totalBorrows.return_value.call.return_value = 0
         mock_mtoken_contract.functions.totalReserves.return_value.call.return_value = 0
@@ -454,6 +460,8 @@ async def test_utilization_calculation_zero_supply(mock_config):
         mock_token_contract.functions.decimals.return_value.call.return_value = 6
 
         def contract_side_effect(address, abi):
+            if address == MOONWELL_CONTRACTS["base-mainnet"]["comptroller"]:
+                return mock_comptroller_contract
             if address == musdc_address:
                 return mock_mtoken_contract
             elif address == usdc_address:

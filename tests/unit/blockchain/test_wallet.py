@@ -18,16 +18,25 @@ def mock_config():
         "max_transaction_value_usd": Decimal("1000"),
         "daily_spending_limit_usd": Decimal("5000"),
         "wallet_id": "test-wallet-id-123",
+        # These tests exercise tx shape / limit math, not contract whitelisting;
+        # disable strict mode so a non-whitelisted test recipient isn't blocked.
+        "strict_mode": False,
     }
 
 
 @pytest.fixture
 def mock_wallet_provider():
-    """Mock CDP wallet provider instance."""
-    provider = AsyncMock()
-    provider.get_address = AsyncMock(return_value="0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb44")
-    provider.get_balance = AsyncMock(return_value=Decimal("1.5"))
-    provider.export = AsyncMock(return_value={"encrypted": "wallet_data"})
+    """Mock CDP wallet provider instance.
+
+    The real ``CdpEvmWalletProvider`` exposes ``get_address`` / ``get_balance``
+    as *synchronous* methods (the source calls them without ``await``), so these
+    are plain ``Mock``s — an ``AsyncMock`` would return an un-awaited coroutine
+    that the source then fails to convert.
+    """
+    provider = Mock()
+    provider.get_address = Mock(return_value="0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb44")
+    provider.get_balance = Mock(return_value=Decimal("1.5"))
+    provider.export = Mock(return_value={"encrypted": "wallet_data"})
     return provider
 
 
@@ -196,18 +205,15 @@ async def test_build_transaction_exceeds_limits(mock_config, mock_wallet_provide
 
 
 @pytest.mark.asyncio
-async def test_export_wallet_data_dry_run(mock_config, mock_wallet_provider):
-    """Test exporting wallet data with confirmation bypass."""
+async def test_export_wallet_data_not_implemented(mock_config, mock_wallet_provider):
+    """Wallet export is intentionally unimplemented (CDP AgentKit exposes no export)."""
     wallet_manager = WalletManager(mock_config)
     wallet_manager.wallet_provider = mock_wallet_provider
     wallet_manager.address = "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb4"
 
-    # Bypass confirmation for testing
-    result = await wallet_manager.export_wallet_data(require_confirmation=False)
-
-    assert result["address"] == "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb4"
-    assert "warning" in result
-    assert "CRITICAL" in result["warning"]
+    # Bypass confirmation; the export path must raise NotImplementedError.
+    with pytest.raises(NotImplementedError, match="not yet implemented"):
+        await wallet_manager.export_wallet_data(require_confirmation=False)
 
 
 @pytest.mark.asyncio
