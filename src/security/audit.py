@@ -53,6 +53,12 @@ class AuditEventType(Enum):
     VALIDATION_FAILED = "validation_failed"
     SPENDING_LIMIT_BREACH = "spending_limit_breach"
 
+    # WS3: autonomous-loop resilience events
+    CIRCUIT_BREAKER_TRIPPED = "circuit_breaker_tripped"
+    CIRCUIT_BREAKER_RESET = "circuit_breaker_reset"
+    FUNDS_STRANDED = "funds_stranded"
+    FUNDS_RECOVERED = "funds_recovered"
+
 
 class AuditSeverity(Enum):
     """Severity levels for audit events."""

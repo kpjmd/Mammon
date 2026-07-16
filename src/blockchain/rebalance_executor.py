@@ -192,6 +192,7 @@ class RebalanceExecutor:
             RuntimeError: If execution fails
         """
         execution = RebalanceExecution(recommendation=recommendation)
+        intent_id: Optional[int] = None
 
         await self.audit_logger.log_event(
             AuditEventType.REBALANCE_OPPORTUNITY_FOUND,
@@ -282,9 +283,19 @@ class RebalanceExecutor:
 
                 return execution
 
+            # Record a durable intent so a partial (withdraw-ok/deposit-failed)
+            # run leaves a queryable "stranded" state. Live path only — the
+            # dry-run branch returned above.
+            intent_id = await self._create_intent(recommendation)
+
             # Step 3: Withdraw from source (if rebalancing existing position)
             if recommendation.from_protocol:
                 await self._execute_withdraw_step(recommendation, execution)
+                await self._update_intent(
+                    intent_id,
+                    last_step=RebalanceStep.WITHDRAW.value,
+                    withdraw_tx_hash=self._step_tx_hash(execution, RebalanceStep.WITHDRAW),
+                )
 
             # Step 4: Swap if needed (different tokens)
             if self._requires_swap(recommendation):
@@ -292,9 +303,17 @@ class RebalanceExecutor:
 
             # Step 5: Approve target protocol
             await self._execute_approve_deposit_step(recommendation, execution)
+            await self._update_intent(
+                intent_id, last_step=RebalanceStep.APPROVE_DEPOSIT.value
+            )
 
             # Step 6: Deposit to target protocol
             await self._execute_deposit_step(recommendation, execution)
+            await self._update_intent(
+                intent_id,
+                last_step=RebalanceStep.DEPOSIT.value,
+                deposit_tx_hash=self._step_tx_hash(execution, RebalanceStep.DEPOSIT),
+            )
 
             # Step 7: Verify final balances
             await self._verify_final_balances(recommendation, execution)
@@ -305,6 +324,7 @@ class RebalanceExecutor:
             # Mark as successful
             execution.success = True
             execution.completed_at = datetime.now()
+            await self._update_intent(intent_id, status="completed")
 
             await self.audit_logger.log_event(
                 AuditEventType.REBALANCE_EXECUTED,
@@ -327,12 +347,22 @@ class RebalanceExecutor:
             execution.success = False
             execution.completed_at = datetime.now()
 
+            # Classify the failure for the intent ledger: if a withdraw
+            # succeeded but no deposit did, funds are stranded mid-rebalance.
+            stranded = self._is_stranded(execution)
+            await self._finalize_failed_intent(intent_id, execution, str(e), stranded)
+
             await self.audit_logger.log_event(
-                AuditEventType.SECURITY_VIOLATION,
-                AuditSeverity.ERROR,
-                f"Rebalance execution failed: {str(e)}",
+                AuditEventType.FUNDS_STRANDED if stranded else AuditEventType.SECURITY_VIOLATION,
+                AuditSeverity.CRITICAL if stranded else AuditSeverity.ERROR,
+                (
+                    f"Rebalance STRANDED funds (withdraw succeeded, deposit failed): {str(e)}"
+                    if stranded
+                    else f"Rebalance execution failed: {str(e)}"
+                ),
                 metadata={
                     "error": str(e),
+                    "stranded": stranded,
                     "steps_completed": len(execution.steps),
                     "last_step": execution.steps[-1].step.value if execution.steps else None,
                 },
@@ -340,10 +370,88 @@ class RebalanceExecutor:
 
             logger.error(f"❌ Rebalance execution failed: {e}")
             await self._persist_transactions(recommendation, execution)
+            try:
+                from src.utils.alerts import get_alert_manager, AlertLevel
+
+                last_step = execution.steps[-1].step.value if execution.steps else "none"
+                await get_alert_manager().send(
+                    AlertLevel.CRITICAL if stranded else AlertLevel.ERROR,
+                    "Rebalance stranded funds" if stranded else "Rebalance failed",
+                    f"{recommendation.from_protocol} → {recommendation.to_protocol} "
+                    f"failed at step '{last_step}': {e}",
+                )
+            except Exception as alert_err:
+                logger.error(f"Alert dispatch failed: {alert_err}")
             raise
 
         await self._persist_transactions(recommendation, execution)
         return execution
+
+    @staticmethod
+    def _step_tx_hash(
+        execution: RebalanceExecution, step: RebalanceStep
+    ) -> Optional[str]:
+        """Return the tx hash recorded for a step, if any."""
+        result = execution.get_step_result(step)
+        return result.tx_hash if result else None
+
+    @staticmethod
+    def _is_stranded(execution: RebalanceExecution) -> bool:
+        """True if a withdraw succeeded but no deposit did (funds mid-flight)."""
+        withdraw = execution.get_step_result(RebalanceStep.WITHDRAW)
+        deposit = execution.get_step_result(RebalanceStep.DEPOSIT)
+        withdrew = withdraw is not None and withdraw.success
+        deposited = deposit is not None and deposit.success
+        return withdrew and not deposited
+
+    async def _create_intent(
+        self, recommendation: RebalanceRecommendation
+    ) -> Optional[int]:
+        """Persist an in-progress rebalance intent. No-op without a database."""
+        if self.database is None:
+            return None
+        try:
+            from src.data.models import RebalanceIntent
+
+            async with self.database.get_session() as session:
+                intent = BaseRepository(session, RebalanceIntent).create(
+                    from_protocol=recommendation.from_protocol,
+                    to_protocol=recommendation.to_protocol,
+                    token=recommendation.token,
+                    amount=recommendation.amount,
+                    status="in_progress",
+                )
+                return intent.id
+        except Exception as e:
+            logger.error(f"Failed to create rebalance intent: {e}")
+            return None
+
+    async def _update_intent(self, intent_id: Optional[int], **fields: Any) -> None:
+        """Update fields on a rebalance intent. No-op without id/database."""
+        if intent_id is None or self.database is None:
+            return
+        try:
+            from src.data.models import RebalanceIntent
+
+            async with self.database.get_session() as session:
+                BaseRepository(session, RebalanceIntent).update(intent_id, **fields)
+        except Exception as e:
+            logger.error(f"Failed to update rebalance intent {intent_id}: {e}")
+
+    async def _finalize_failed_intent(
+        self,
+        intent_id: Optional[int],
+        execution: RebalanceExecution,
+        error: str,
+        stranded: bool,
+    ) -> None:
+        """Mark a failed intent as 'stranded' or 'failed'."""
+        await self._update_intent(
+            intent_id,
+            status="stranded" if stranded else "failed",
+            error=error,
+            withdraw_tx_hash=self._step_tx_hash(execution, RebalanceStep.WITHDRAW),
+        )
 
     async def _persist_transactions(
         self,

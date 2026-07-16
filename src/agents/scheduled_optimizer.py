@@ -23,9 +23,12 @@ from src.strategies.profitability_calculator import ProfitabilityCalculator
 from src.blockchain.rebalance_executor import RebalanceExecutor, RebalanceExecution
 from src.blockchain.wallet import WalletManager
 from src.data.database import Database, BaseRepository
-from src.data.models import Decision
+from src.data.models import Decision, RebalanceIntent
 from src.security.audit import AuditLogger, AuditEventType, AuditSeverity
 from src.utils.logger import get_logger
+from src.utils.cycle_breaker import CycleCircuitBreaker
+from src.utils.heartbeat import write_heartbeat
+from src.utils.alerts import get_alert_manager
 
 logger = get_logger(__name__)
 
@@ -45,11 +48,13 @@ class SchedulerStatus:
         self.total_opportunities_skipped: int = 0
         self.total_gas_spent_usd: Decimal = Decimal("0")
         self.errors: List[Dict[str, Any]] = []
+        self.halted: bool = False  # circuit breaker tripped
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert status to dictionary for serialization."""
         return {
             "running": self.running,
+            "halted": self.halted,
             "start_time": self.start_time.isoformat() if self.start_time else None,
             "last_scan_time": (
                 self.last_scan_time.isoformat() if self.last_scan_time else None
@@ -131,6 +136,24 @@ class ScheduledOptimizer:
         self.min_profit_usd = config.get("min_profit_usd", Decimal("10"))
         self.dry_run_mode = config.get("dry_run_mode", False)
         self.target_token = config.get("target_token", "USDC")
+
+        # Resilience (WS3): latching circuit breaker + liveness heartbeat
+        self.breaker = CycleCircuitBreaker(
+            max_consecutive=config.get("circuit_breaker_consecutive_failures", 3),
+            max_per_24h=config.get("circuit_breaker_max_failures_per_day", 10),
+            state_file=config.get(
+                "circuit_breaker_state_file", "data/circuit_breaker_state.json"
+            ),
+        )
+        self.heartbeat_file = config.get("heartbeat_file", "data/heartbeat.json")
+        self.max_wallet_balance_usd = Decimal(
+            str(config.get("max_wallet_balance_usd", "2000"))
+        )
+        self.recovery_max_gas_usd = Decimal(
+            str(config.get("recovery_max_gas_usd", "1"))
+        )
+        self._last_balance_alert: Optional[datetime] = None
+        self._alerts = get_alert_manager()
 
         # State
         self.status = SchedulerStatus()
@@ -281,7 +304,26 @@ class ScheduledOptimizer:
 
         executions: List[RebalanceExecution] = []
 
+        # Circuit breaker: once tripped, skip ALL action until an operator
+        # resets it (scripts/resume_optimizer.py). The process stays alive so
+        # the heartbeat keeps flowing and the loop can be resumed in place.
+        if self.breaker.is_tripped():
+            self.status.halted = True
+            reason = self.breaker.trip_reason or "unknown"
+            logger.critical(f"🛑 Circuit breaker TRIPPED — skipping cycle: {reason}")
+            if self.breaker.needs_alert():
+                await self._safe_alert(
+                    "critical", "Circuit breaker tripped", reason
+                )
+            self._write_cycle_heartbeat(last_cycle_ok=False)
+            return executions
+
         try:
+            # Cycle-start housekeeping: surface stranded funds and balance-cap
+            # breaches before doing any new work (best-effort, never fatal).
+            await self._alert_stranded_intents()
+            await self._check_balance_cap()
+
             # 1. Get current positions
             current_positions = await self._get_current_positions()
 
@@ -303,7 +345,7 @@ class ScheduledOptimizer:
                 else:
                     logger.info("No positions and no idle capital - nothing to do")
 
-                return executions
+                return self._cycle_succeeded(executions)
 
             logger.info(f"Found {len(recommendations)} potential opportunities")
             self.status.total_opportunities_found += len(recommendations)
@@ -418,10 +460,29 @@ class ScheduledOptimizer:
             logger.info(f"Cycle complete: {len(executions)} rebalances executed")
             logger.info("=" * 80)
 
-            return executions
+            return self._cycle_succeeded(executions)
 
         except Exception as e:
             logger.error(f"Error in optimization cycle: {e}", exc_info=True)
+            # Record the failure; trip and alert if this crosses the threshold.
+            tripped = self.breaker.record_failure(str(e))
+            if tripped:
+                self.status.halted = True
+                await self.audit_logger.log_event(
+                    event_type=AuditEventType.CIRCUIT_BREAKER_TRIPPED,
+                    severity=AuditSeverity.CRITICAL,
+                    message=f"Circuit breaker tripped after cycle failure: {e}",
+                    metadata={"error": str(e), "reason": self.breaker.trip_reason},
+                )
+                if self.breaker.needs_alert():
+                    await self._safe_alert(
+                        "critical",
+                        "Circuit breaker tripped",
+                        self.breaker.trip_reason or str(e),
+                    )
+            else:
+                await self._safe_alert("error", "Optimization cycle failed", str(e))
+            self._write_cycle_heartbeat(last_cycle_ok=False)
             raise
 
     async def _get_current_positions(self) -> Dict[str, Decimal]:
@@ -666,7 +727,14 @@ class ScheduledOptimizer:
         # implemented yet, and would fail at execution time.
         protocol_allowlist = getattr(self.optimizer.strategy, "supported_protocols", None)
 
+        # Tokens with stranded funds get a recovery path that bypasses the
+        # minimum-profit gate (idle funds earn 0%, so any positive APY is an
+        # improvement; the withdraw gas is already spent). Still capped by
+        # recovery_max_gas_usd and the usual daily/risk/wallet limits.
+        recovery_tokens = await self._stranded_recovery_tokens()
+
         for token, amount in idle_capital.items():
+            is_recovery = token.upper() in recovery_tokens
             try:
                 # Find best yield for this token
                 best_opportunity = await self.yield_scanner.find_best_yield(
@@ -700,13 +768,21 @@ class ScheduledOptimizer:
                     confidence=80,  # High confidence for simple deployment
                 )
 
-                # Check profitability (mainly gas cost vs yield)
-                if not await self._is_deployment_profitable(recommendation):
-                    logger.info("Skipping deployment - not profitable after gas costs")
+                # Check profitability. Recovery deployments bypass the min-profit
+                # gate but must still clear the recovery gas ceiling.
+                if is_recovery:
+                    deployable = await self._is_recovery_deployable(recommendation)
+                    skip_reason = "Recovery deployment exceeds gas ceiling"
+                else:
+                    deployable = await self._is_deployment_profitable(recommendation)
+                    skip_reason = "Unprofitable after gas costs"
+
+                if not deployable:
+                    logger.info(f"Skipping deployment - {skip_reason.lower()}")
                     self.status.total_opportunities_skipped += 1
                     await self._record_decision(
                         decision_type="idle_deployment",
-                        rationale="Unprofitable after gas costs",
+                        rationale=skip_reason,
                         from_protocol=None,
                         to_protocol=best_opportunity.protocol,
                         approved=-1,
@@ -783,6 +859,9 @@ class ScheduledOptimizer:
                     logger.info(
                         f"✅ Deployment successful! Gas: ${execution.total_gas_cost_usd}"
                     )
+
+                    if is_recovery:
+                        await self._mark_recovered(token)
                 else:
                     self.status.total_opportunities_skipped += 1
                     logger.warning(f"❌ Deployment failed: {execution.error}")
@@ -824,3 +903,171 @@ class ScheduledOptimizer:
             return False
 
         return True
+
+    # -- WS3 resilience helpers --------------------------------------------
+    def _cycle_succeeded(
+        self, executions: List[RebalanceExecution]
+    ) -> List[RebalanceExecution]:
+        """Record a clean cycle (reset breaker, heartbeat) on any success path."""
+        self.breaker.record_success()
+        self._write_cycle_heartbeat(last_cycle_ok=True)
+        return executions
+
+    async def _safe_alert(self, level: str, title: str, message: str) -> None:
+        """Fire an alert without ever letting it break the caller."""
+        try:
+            await getattr(self._alerts, level)(title, message)
+        except Exception as e:
+            logger.error(f"Alert dispatch failed: {e}")
+
+    def _write_cycle_heartbeat(self, last_cycle_ok: bool) -> None:
+        """Write the liveness heartbeat for this cycle (best-effort)."""
+        write_heartbeat(
+            self.heartbeat_file,
+            last_cycle_ok=last_cycle_ok,
+            total_scans=self.status.total_scans,
+            breaker_tripped=self.breaker.is_tripped(),
+        )
+
+    async def _check_balance_cap(self) -> None:
+        """Warn (once per 24h) if portfolio value exceeds the hot-wallet cap.
+
+        Detection only — this does not block deposits (that would fight the idle-
+        capital deployer). The alert prompts moving excess to cold storage.
+        """
+        try:
+            idle = await self._get_idle_capital()
+            positions = await self._get_current_positions()
+            portfolio_usd = sum(idle.values(), Decimal("0")) + sum(
+                positions.values(), Decimal("0")
+            )
+            if portfolio_usd <= self.max_wallet_balance_usd:
+                return
+
+            now = datetime.now(UTC)
+            if (
+                self._last_balance_alert is not None
+                and (now - self._last_balance_alert) < timedelta(hours=24)
+            ):
+                return
+            self._last_balance_alert = now
+
+            msg = (
+                f"Portfolio ${portfolio_usd:.2f} exceeds hot-wallet cap "
+                f"${self.max_wallet_balance_usd:.2f} — move excess to cold storage"
+            )
+            logger.warning(f"⚠️  {msg}")
+            await self.audit_logger.log_event(
+                event_type=AuditEventType.RISK_ALERT,
+                severity=AuditSeverity.WARNING,
+                message=msg,
+                metadata={
+                    "portfolio_usd": float(portfolio_usd),
+                    "cap_usd": float(self.max_wallet_balance_usd),
+                },
+            )
+            await self._safe_alert("warn", "Hot-wallet balance cap exceeded", msg)
+        except Exception as e:
+            logger.error(f"Balance-cap check failed: {e}")
+
+    async def _get_stranded_intents(self) -> List[RebalanceIntent]:
+        """Return intents left in 'stranded' state (withdraw-ok/deposit-failed)."""
+        if self.database is None:
+            return []
+        try:
+            async with self.database.get_session() as session:
+                return (
+                    session.query(RebalanceIntent)
+                    .filter(RebalanceIntent.status == "stranded")
+                    .all()
+                )
+        except Exception as e:
+            logger.error(f"Failed to query stranded intents: {e}")
+            return []
+
+    async def _alert_stranded_intents(self) -> None:
+        """Alert (once each) on any stranded funds detected at cycle start."""
+        stranded = await self._get_stranded_intents()
+        for intent in stranded:
+            if intent.alerted_at is not None:
+                continue
+            msg = (
+                f"Stranded funds: withdrew {intent.amount} {intent.token} from "
+                f"{intent.from_protocol}, deposit to {intent.to_protocol} failed"
+            )
+            logger.critical(f"🚨 {msg}")
+            await self.audit_logger.log_event(
+                event_type=AuditEventType.FUNDS_STRANDED,
+                severity=AuditSeverity.CRITICAL,
+                message=msg,
+                metadata={"intent_id": intent.id, "token": intent.token},
+            )
+            await self._safe_alert("critical", "Stranded funds detected", msg)
+            # Stamp alerted_at so we don't re-alert every cycle.
+            try:
+                async with self.database.get_session() as session:
+                    BaseRepository(session, RebalanceIntent).update(
+                        intent.id, alerted_at=datetime.utcnow()
+                    )
+            except Exception as e:
+                logger.error(f"Failed to stamp stranded-intent alert: {e}")
+
+    async def _stranded_recovery_tokens(self) -> set:
+        """Token symbols with stranded funds awaiting re-deployment."""
+        return {i.token.upper() for i in await self._get_stranded_intents()}
+
+    async def _is_recovery_deployable(
+        self, recommendation: RebalanceRecommendation
+    ) -> bool:
+        """Recovery gate: deploy stranded funds if APY>0 and gas within ceiling.
+
+        Bypasses the minimum-annual-gain gate (which would reject re-deploying a
+        small stranded balance forever), but still enforces a gas ceiling so
+        recovery never costs more than recovery_max_gas_usd.
+        """
+        try:
+            if recommendation.expected_apy <= 0:
+                return False
+            analysis = await self.profitability_calc.calculate_profitability(
+                current_apy=Decimal("0"),
+                target_apy=recommendation.expected_apy,
+                position_size_usd=recommendation.amount,
+                requires_swap=False,
+                swap_amount_usd=Decimal("0"),
+            )
+            if analysis.total_cost > self.recovery_max_gas_usd:
+                logger.warning(
+                    f"Recovery gas ${analysis.total_cost} exceeds ceiling "
+                    f"${self.recovery_max_gas_usd}"
+                )
+                return False
+            return True
+        except Exception as e:
+            logger.error(f"Recovery deployability check failed: {e}")
+            return False
+
+    async def _mark_recovered(self, token: str) -> None:
+        """Mark stranded intents for a token as recovered after re-deployment."""
+        if self.database is None:
+            return
+        try:
+            async with self.database.get_session() as session:
+                repo = BaseRepository(session, RebalanceIntent)
+                stranded = (
+                    session.query(RebalanceIntent)
+                    .filter(
+                        RebalanceIntent.status == "stranded",
+                        RebalanceIntent.token == token,
+                    )
+                    .all()
+                )
+                for intent in stranded:
+                    repo.update(intent.id, status="recovered")
+            await self.audit_logger.log_event(
+                event_type=AuditEventType.FUNDS_RECOVERED,
+                severity=AuditSeverity.INFO,
+                message=f"Stranded {token} funds re-deployed",
+                metadata={"token": token, "count": len(stranded)},
+            )
+        except Exception as e:
+            logger.error(f"Failed to mark {token} recovered: {e}")

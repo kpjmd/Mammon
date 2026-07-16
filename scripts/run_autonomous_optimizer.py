@@ -46,6 +46,8 @@ from src.strategies.simple_yield import SimpleYieldStrategy
 from src.security.audit import AuditLogger
 from src.utils.config import get_settings
 from src.utils.logger import get_logger
+from src.utils.heartbeat import write_heartbeat
+from src.utils.alerts import get_alert_manager
 
 logger = get_logger(__name__)
 
@@ -122,6 +124,13 @@ class AutonomousRunner:
             "chainlink_enabled": True,
             "max_transaction_value_usd": self.settings.max_transaction_value_usd,
             "daily_spending_limit_usd": self.settings.daily_spending_limit_usd,
+            # Live wallet safety latch + balance cap (WS2 hardening)
+            "wallet_auto_pause": self.settings.wallet_auto_pause,
+            "max_wallet_balance_usd": self.settings.max_wallet_balance_usd,
+            # Circuit breaker + stranded-funds recovery (WS3 hardening)
+            "circuit_breaker_consecutive_failures": self.settings.circuit_breaker_consecutive_failures,
+            "circuit_breaker_max_failures_per_day": self.settings.circuit_breaker_max_failures_per_day,
+            "recovery_max_gas_usd": float(self.settings.recovery_max_gas_usd),
             "min_apy_improvement": float(self.settings.min_apy_improvement),
             "min_profit_usd": float(self.settings.min_profit_usd),
             "max_break_even_days": self.settings.max_break_even_days,
@@ -366,6 +375,15 @@ class AutonomousRunner:
                         elapsed = (datetime.now(UTC) - sleep_start).total_seconds()
                         logger.info(f"💤 Sleep heartbeat: {iterations_completed}/{sleep_iterations} iterations, {elapsed:.0f}s elapsed")
                         print(f"  💤 Sleep heartbeat: {iterations_completed}/{sleep_iterations} iterations ({elapsed:.0f}s elapsed)")
+                        # Refresh the liveness heartbeat during long sleeps so a
+                        # 2h idle interval isn't misread as a dead loop.
+                        write_heartbeat(
+                            self.settings.heartbeat_file,
+                            last_cycle_ok=True,
+                            total_scans=self.total_scans,
+                            breaker_tripped=self.scheduler.breaker.is_tripped(),
+                            extra={"phase": "sleep"},
+                        )
 
                 # Check for sleep anomalies
                 sleep_end = datetime.now(UTC)
@@ -401,6 +419,15 @@ class AutonomousRunner:
         print(f"\n{'='*60}")
         print(f"SCAN #{self.total_scans} at {scan_start_time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
         print(f"{'='*60}")
+
+        # If the circuit breaker is latched, keep the process alive but do no
+        # work — an operator must run scripts/resume_optimizer.py to continue.
+        if self.scheduler.breaker.is_tripped():
+            reason = self.scheduler.breaker.trip_reason or "unknown"
+            logger.critical(f"🛑 Circuit breaker tripped — scan skipped: {reason}")
+            print(f"\n  🛑 HALTED (circuit breaker): {reason}")
+            print("     Run: python scripts/resume_optimizer.py --confirm")
+            return
 
         try:
             # Run optimizer scan with timeout protection (watchdog)
@@ -484,6 +511,12 @@ class AutonomousRunner:
             })
             print(f"\n  ❌ {error_msg}")
             print(f"     Continuing to next scan cycle...")
+            try:
+                await get_alert_manager().critical(
+                    "Scan watchdog timeout", error_msg
+                )
+            except Exception as alert_err:
+                logger.error(f"Alert dispatch failed: {alert_err}")
 
         except Exception as e:
             logger.error(f"Error in scan cycle: {e}")

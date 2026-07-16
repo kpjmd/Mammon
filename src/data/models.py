@@ -89,6 +89,35 @@ class Decision(Base):
     transaction = relationship("Transaction", backref="decision")
 
 
+class RebalanceIntent(Base):
+    """Tracks a multi-step rebalance so partial failures are queryable.
+
+    A rebalance is a sequence of separate on-chain transactions (withdraw →
+    approve → deposit) with no atomicity. If the withdraw succeeds but the
+    deposit fails, funds are left idle mid-rebalance ("stranded"). Persisting
+    the intent and the last step reached makes that state detectable so the
+    optimizer can alert and re-deploy the stranded funds on the next cycle.
+
+    status: in_progress | completed | failed | stranded | recovered
+    """
+
+    __tablename__ = "rebalance_intents"
+
+    id = Column(Integer, primary_key=True)
+    from_protocol = Column(String(50), nullable=True)  # None for idle deployment
+    to_protocol = Column(String(50), nullable=False)
+    token = Column(String(20), nullable=False)
+    amount = Column(Numeric(precision=36, scale=18), nullable=False)
+    status = Column(String(20), nullable=False, default="in_progress")
+    last_step = Column(String(30), nullable=True)  # RebalanceStep.value reached
+    withdraw_tx_hash = Column(String(66), nullable=True)
+    deposit_tx_hash = Column(String(66), nullable=True)
+    error = Column(Text, nullable=True)
+    alerted_at = Column(DateTime, nullable=True)  # stranded-alert de-dup
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class PerformanceMetric(Base):
     """Tracks performance metrics over time.
 
