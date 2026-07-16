@@ -47,6 +47,7 @@ from src.security.audit import AuditLogger
 from src.utils.config import get_settings
 from src.utils.logger import get_logger
 from src.utils.heartbeat import write_heartbeat
+from src.utils.alerts import get_alert_manager
 
 logger = get_logger(__name__)
 
@@ -510,6 +511,12 @@ class AutonomousRunner:
             })
             print(f"\n  ❌ {error_msg}")
             print(f"     Continuing to next scan cycle...")
+            try:
+                await get_alert_manager().critical(
+                    "Scan watchdog timeout", error_msg
+                )
+            except Exception as alert_err:
+                logger.error(f"Alert dispatch failed: {alert_err}")
 
         except Exception as e:
             logger.error(f"Error in scan cycle: {e}")

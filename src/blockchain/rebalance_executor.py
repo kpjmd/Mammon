@@ -370,6 +370,18 @@ class RebalanceExecutor:
 
             logger.error(f"❌ Rebalance execution failed: {e}")
             await self._persist_transactions(recommendation, execution)
+            try:
+                from src.utils.alerts import get_alert_manager, AlertLevel
+
+                last_step = execution.steps[-1].step.value if execution.steps else "none"
+                await get_alert_manager().send(
+                    AlertLevel.CRITICAL if stranded else AlertLevel.ERROR,
+                    "Rebalance stranded funds" if stranded else "Rebalance failed",
+                    f"{recommendation.from_protocol} → {recommendation.to_protocol} "
+                    f"failed at step '{last_step}': {e}",
+                )
+            except Exception as alert_err:
+                logger.error(f"Alert dispatch failed: {alert_err}")
             raise
 
         await self._persist_transactions(recommendation, execution)
