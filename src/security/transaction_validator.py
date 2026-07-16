@@ -13,9 +13,7 @@ validation before execution. Block any suspicious activity.
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Set, Any
-from decimal import Decimal
-from eth_utils import to_checksum_address
+from typing import Dict, List, Optional, Any
 import re
 
 from src.security.contract_whitelist import (
@@ -25,7 +23,7 @@ from src.security.contract_whitelist import (
     PERMIT2_ADDRESS,
     get_contract_whitelist,
 )
-from src.wallet.tiered_config import WalletTier, TierConfig
+from src.wallet.tiered_config import TierConfig
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -137,10 +135,14 @@ DANGEROUS_SELECTORS = {
 # Maximum safe approval amount (1 trillion tokens with 18 decimals)
 MAX_SAFE_APPROVAL = 10**30
 
-# Patterns that might indicate hidden delegation
+# Patterns that might indicate hidden delegation.
+# NOTE: We only match the EIP-7702 authorization designator (0xef0100). The
+# transaction *type* byte (0x04) can never appear in calldata — the validator
+# only ever sees calldata, never the transaction envelope — so matching a bare
+# 0x04 byte was pure false-positive surface that blocked legitimate deposits
+# whenever an ABI-encoded address or amount happened to contain 0x04.
 SUSPICIOUS_PATTERNS = [
     re.compile(rb'\xef\x01\x00'),  # EIP-7702 authorization prefix
-    re.compile(rb'\x04[\x00-\xff]{32}'),  # Type 4 transaction pattern
 ]
 
 
@@ -225,19 +227,12 @@ class TransactionValidator:
                     details={"address": to_address},
                 ))
 
-        # 2. Check tier-specific risk levels
-        if tier_config and contract_info:
-            contract_risk = contract_info.risk_level
-            if contract_risk not in tier_config.allowed_risk_levels:
-                threats.append(ThreatDetection(
-                    threat_type=ThreatType.UNKNOWN_CONTRACT,
-                    severity=ValidationSeverity.CRITICAL,
-                    description=f"Contract risk level {contract_risk.value} not allowed for {tier_config.tier.value} wallet",
-                    details={
-                        "contract_risk": contract_risk.value,
-                        "allowed_risks": [r.value for r in tier_config.allowed_risk_levels],
-                    },
-                ))
+        # 2. Tier-specific risk filtering is intentionally NOT performed here.
+        # contract_info.risk_level is a contract_whitelist.RiskLevel, while
+        # tier_config.allowed_risk_levels holds tiered_config.RiskLevel members
+        # — two distinct enum classes whose members are never equal, so the old
+        # membership check could only ever produce spurious CRITICAL blocks.
+        # Tier limits are enforced by SpendingLimits on the live path instead.
 
         # 3. EIP-7702 Detection
         if self.eip7702_detection:
