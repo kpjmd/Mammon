@@ -31,16 +31,6 @@ async def test_morpho_initialization(mock_config):
     assert morpho.read_only is True
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Source gap: MorphoProtocol.__init__ always loads MORPHO_CONTRACTS['base-mainnet'], "
-        "which omits 'morpho_chainlink_oracle_v2' (only present under 'base-sepolia'), so "
-        "contracts.get(...) returns None and several tx-building paths fall back to '' as an "
-        "address. Needs the correct base-mainnet oracle address added to the source "
-        "(tracked as a follow-up); un-xfail and update expected value once known."
-    ),
-    strict=False,
-)
 @pytest.mark.asyncio
 async def test_morpho_initialization_with_correct_contract_address(mock_config):
     """Test Morpho exposes the Chainlink oracle v2 contract address."""
