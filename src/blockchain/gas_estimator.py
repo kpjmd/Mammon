@@ -153,6 +153,10 @@ class GasEstimator:
 
             return gas_price
 
+        except ValueError:
+            # Gas-price cap breach is a safety rail — it must propagate, not be
+            # swallowed by the RPC-failure fallback below.
+            raise
         except Exception as e:
             logger.error(f"Failed to fetch gas price: {e}")
             # Return network-appropriate default

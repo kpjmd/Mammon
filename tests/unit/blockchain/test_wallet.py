@@ -31,11 +31,12 @@ def mock_wallet_provider():
     The real ``CdpEvmWalletProvider`` exposes ``get_address`` / ``get_balance``
     as *synchronous* methods (the source calls them without ``await``), so these
     are plain ``Mock``s — an ``AsyncMock`` would return an un-awaited coroutine
-    that the source then fails to convert.
+    that the source then fails to convert. ``get_balance`` takes NO arguments and
+    returns the native balance in WEI, so the mock returns 1.5 ETH as wei.
     """
     provider = Mock()
     provider.get_address = Mock(return_value="0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb44")
-    provider.get_balance = Mock(return_value=Decimal("1.5"))
+    provider.get_balance = Mock(return_value=1_500_000_000_000_000_000)  # 1.5 ETH in wei
     provider.export = Mock(return_value={"encrypted": "wallet_data"})
     return provider
 
@@ -86,7 +87,29 @@ async def test_get_balance_success(mock_config, mock_wallet_provider):
     balance = await wallet_manager.get_balance("eth")
 
     assert balance == Decimal("1.5")
-    mock_wallet_provider.get_balance.assert_called_once_with("eth")
+    # Real CdpEvmWalletProvider.get_balance takes no arguments.
+    mock_wallet_provider.get_balance.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_get_balance_eth_converts_wei_to_eth(mock_config):
+    """Regression: ETH balance path matches the real CDP provider surface.
+
+    ``CdpEvmWalletProvider.get_balance`` is synchronous, takes no arguments, and
+    returns wei. ``get_balance('ETH')`` must call it with no args and convert
+    wei -> ETH (÷1e18), not treat the raw wei value as ETH.
+    """
+    provider = Mock()
+    provider.get_address = Mock(return_value="0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb44")
+    provider.get_balance = Mock(return_value=2_000_000_000_000_000_000)  # 2 ETH in wei
+
+    wallet_manager = WalletManager(mock_config)
+    wallet_manager.wallet_provider = provider
+
+    balance = await wallet_manager.get_balance("ETH")
+
+    assert balance == Decimal("2")
+    provider.get_balance.assert_called_once_with()
 
 
 @pytest.mark.asyncio

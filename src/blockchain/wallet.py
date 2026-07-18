@@ -234,10 +234,12 @@ class WalletManager:
         try:
             token_upper = token.upper()
 
-            # ETH balance via CDP wallet provider
+            # ETH balance via CDP wallet provider.
+            # The real CdpEvmWalletProvider.get_balance is SYNCHRONOUS, takes NO
+            # args, and returns the native balance in WEI — convert wei -> ETH.
             if token_upper == "ETH":
-                balance = self.wallet_provider.get_balance(token.lower())
-                balance_decimal = Decimal(str(balance))
+                balance_wei = self.wallet_provider.get_balance()
+                balance_decimal = Decimal(str(balance_wei)) / Decimal(10**18)
                 logger.debug(f"Balance for {token}: {balance_decimal}")
                 return balance_decimal
 

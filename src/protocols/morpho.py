@@ -26,6 +26,10 @@ MORPHO_CONTRACTS = {
     "base-mainnet": {
         "morpho_blue": "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb",  # Core protocol
         "morpho_token": "0xBAa5CC21fd487B8Fcc2F632f3F4E8D37262a0842",  # MORPHO token
+        # ChainlinkOracleV2 *Factory* (Base mainnet, on-chain verified). Used as a
+        # placeholder "to"/metadata address by the read-only tx builders below;
+        # real per-market oracle instances come with execution (Sprint 3-4).
+        "morpho_chainlink_oracle_v2": "0x2DC205F24BCb6B311E5cdf0745B0741648Aebd3d",  # Verified ✅
     },
     "base-sepolia": {
         "morpho_chainlink_oracle_v2": "0x2DC205F24BCb6B311E5cdf0745B0741648Aebd3d",  # Verified ✅
