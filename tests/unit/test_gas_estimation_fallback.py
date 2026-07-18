@@ -243,17 +243,6 @@ class TestGasPriceFallback:
             expected = estimator.w3.to_wei(Decimal("0.01"), "gwei")
             assert gas_price == expected
 
-    @pytest.mark.xfail(
-        reason=(
-            "Genuine source bug: GasEstimator.get_gas_price raises the "
-            "'exceeds maximum' ValueError inside its try block, but the broad "
-            "`except Exception` at gas_estimator.py:156 catches it and returns "
-            "the cheap network default instead of propagating — so the gas-price "
-            "cap safety rail never actually fires. Tracked as a follow-up; the "
-            "fix is to re-raise ValueError before the fallback handler."
-        ),
-        strict=False,
-    )
     @pytest.mark.asyncio
     async def test_gas_price_exceeds_cap_raises_error(self):
         """Test that gas price exceeding cap raises error."""
