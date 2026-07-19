@@ -22,6 +22,66 @@ MAMMON is built with security as the top priority. This document outlines our se
 5. ✅ Use type hints and validation
 6. ✅ Test on testnet first
 
+## Key Custody
+
+MAMMON supports two custody modes, selected by `USE_LOCAL_WALLET`.
+
+### CDP MPC Server Wallet (recommended, `USE_LOCAL_WALLET=false`)
+
+Private keys are generated and held inside Coinbase's Trusted Execution
+Environment and **never exist on this machine** — not in a file, not in the
+process environment, not in memory. Signing happens inside the TEE; MAMMON
+sends a transaction request and receives a hash.
+
+Because there is no seed to leak, this eliminates an entire class of
+compromise — including the one MAMMON actually suffered (see below).
+
+Persistence works by **stable account name**, not by a stored address:
+
+```
+CDP_ACCOUNT_NAME=mammon-hot        # same name -> same address, every run
+CDP_EXPECTED_ADDRESS=0x...         # optional, strongly recommended once funded
+```
+
+`CDP_EXPECTED_ADDRESS` is a safety interlock: if the resolved address does not
+match it, startup **fails** rather than proceeding. Without it, a typo in the
+account name silently resolves to a different, empty account.
+
+Implementation: `src/wallet/cdp_mpc_provider.py`. It talks to `cdp-sdk`
+directly and deliberately does **not** use `coinbase-agentkit`'s
+`CdpEvmWalletProvider`, which drops EIP-1559 fee fields on send and would
+silently void the gas-price cap (see Layer 4).
+
+Key export is intentionally unimplemented. Extracting a key from TEE custody
+would reintroduce exactly the exposure this mode exists to prevent.
+
+### Local seed phrase (`USE_LOCAL_WALLET=true`, current default)
+
+Derives a key from `WALLET_SEED` (BIP-39, path `m/44'/60'/0'/0/0`) on this
+machine. Required when local custody is selected; MAMMON refuses to start in
+this mode without a valid seed.
+
+**This mode carries a realized, not theoretical, risk.** On 2025-12-02 a MAMMON
+wallet was drained because its seed phrase was stored in plaintext, world-
+readable files. Prefer CDP MPC custody.
+
+If you must use it:
+- Inject `WALLET_SEED` at runtime only (see `scripts/vps_start.sh`); never write
+  it to disk, never commit it.
+- Note that the current VPS flow passes the seed on an `ssh` command line,
+  exposing it to the remote process table and local shell history. Treat any
+  seed handled that way as compromised if the host is.
+
+### Switching to MPC custody
+
+```
+poetry run python scripts/cdp_show_account.py   # prints the persistent address
+poetry run python scripts/cdp_show_account.py   # run twice - MUST match
+```
+
+Fund that address, set `CDP_EXPECTED_ADDRESS` to it, then set
+`USE_LOCAL_WALLET=false` and remove `WALLET_SEED` from the environment.
+
 ## Multi-Layered Security
 
 ### Layer 1: Configuration Security

@@ -117,7 +117,16 @@ class AutonomousRunner:
         logger.info("⚙️  STEP 1: Building configuration")
         config = {
             "network": self.settings.network,
+            # Custody selection (WS7). Without these keys WalletManager falls
+            # back to config.get("use_local_wallet", True) and the CDP MPC path
+            # is unreachable no matter what the environment says.
+            "use_local_wallet": self.settings.use_local_wallet,
             "wallet_seed": self.settings.wallet_seed,
+            "cdp_api_key": self.settings.cdp_api_key,
+            "cdp_api_secret": self.settings.cdp_api_secret,
+            "cdp_wallet_secret": self.settings.cdp_wallet_secret,
+            "cdp_account_name": self.settings.cdp_account_name,
+            "cdp_expected_address": self.settings.cdp_expected_address,
             "read_only": False,
             "dry_run_mode": self.dry_run,
             "use_mock_data": False,

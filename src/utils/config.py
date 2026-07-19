@@ -6,7 +6,7 @@ variables with validation and security checks.
 
 from decimal import Decimal
 from typing import Optional
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from src.utils.networks import validate_network, get_supported_networks
 
@@ -29,14 +29,38 @@ class Settings(BaseSettings):
     cdp_api_key: str = Field(..., description="Coinbase CDP API key")
     cdp_api_secret: str = Field(..., description="Coinbase CDP API secret")
     cdp_wallet_secret: str = Field(..., description="CDP wallet secret (base64-encoded, NEVER commit!)")
+    cdp_account_name: str = Field(
+        default="mammon-hot",
+        description=(
+            "Stable CDP MPC Server Wallet account name. This is the persistence "
+            "handle: the same name always resolves to the same address. Changing "
+            "it points MAMMON at a DIFFERENT (likely empty) account."
+        ),
+    )
+    cdp_expected_address: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional safety check. If set, the address resolved from "
+            "cdp_account_name must match this exactly, or startup fails. "
+            "Set this to your funded address to prevent a typo'd account "
+            "name from silently running against an empty wallet."
+        ),
+    )
     cdp_wallet_id: Optional[str] = Field(
         default=None,
-        description="CDP wallet ID for persistent wallet (get from import script)",
+        description="DEPRECATED (unused). Superseded by cdp_account_name.",
     )
-    wallet_seed: str = Field(..., description="Wallet seed phrase - BIP39 mnemonic (12 or 24 words, NEVER commit!)")
+    wallet_seed: Optional[str] = Field(
+        default=None,
+        description=(
+            "BIP39 mnemonic for LocalWalletProvider (NEVER commit!). "
+            "Required only when use_local_wallet is True; CDP MPC custody "
+            "needs no local key material. Validated in check_wallet_custody."
+        ),
+    )
     wallet_id: Optional[str] = Field(
         default=None,
-        description="CDP wallet ID (auto-generated on first run)",
+        description="DEPRECATED (unused). Superseded by cdp_account_name.",
     )
     base_rpc_url: str = Field(
         default="https://sepolia.base.org",
@@ -222,7 +246,13 @@ class Settings(BaseSettings):
     # Local Wallet Configuration
     use_local_wallet: bool = Field(
         default=True,
-        description="Use local wallet (seed phrase) instead of CDP wallet",
+        description=(
+            "Custody mode. True: LocalWalletProvider, deriving a key from "
+            "wallet_seed on this machine. False: CDP MPC Server Wallet, where "
+            "keys stay in Coinbase's TEE and no seed is needed. Default stays "
+            "True for now; flip to False after funding the account named by "
+            "cdp_account_name (see scripts/cdp_show_account.py)."
+        ),
     )
     max_priority_fee_gwei: Decimal = Field(
         default=Decimal("2"),
@@ -485,24 +515,26 @@ class Settings(BaseSettings):
 
     @field_validator("wallet_seed")
     @classmethod
-    def validate_wallet_seed(cls, v: str) -> str:
-        """Validate wallet seed is a proper BIP39 mnemonic phrase.
+    def validate_wallet_seed(cls, v: Optional[str]) -> Optional[str]:
+        """Validate wallet seed is a proper BIP39 mnemonic phrase, if present.
+
+        An absent seed is valid here: CDP MPC custody requires no local key
+        material. Whether a seed is actually *required* is a cross-field
+        question answered by check_wallet_custody, since use_local_wallet is
+        declared after this field and so is not visible to a field_validator.
 
         Args:
-            v: Wallet seed value
+            v: Wallet seed value, or None
 
         Returns:
-            Validated seed phrase
+            Validated seed phrase, or None
 
         Raises:
-            ValueError: If seed is invalid
+            ValueError: If a seed is present but malformed
         """
-        # Check for empty/None (Pydantic handles None, but check empty string)
-        if not v or not v.strip():
-            raise ValueError(
-                "wallet_seed is required. Generate a BIP39 seed phrase.\n"
-                "  - NEVER share or commit your seed phrase!"
-            )
+        # Absent seed is allowed; check_wallet_custody enforces when required.
+        if v is None or not v.strip():
+            return None
 
         # Check for placeholders
         if v.startswith("your_") or v.endswith("_here"):
@@ -649,6 +681,38 @@ class Settings(BaseSettings):
             print("🔒 Dry-run mode ENABLED - All transactions will be simulated")
 
         return v
+
+    @model_validator(mode="after")
+    def check_wallet_custody(self) -> "Settings":
+        """Enforce that the selected custody mode has what it needs.
+
+        A seed is required only for local custody. Requiring one unconditionally
+        would force CDP MPC operators to keep key material on the box, defeating
+        the entire point of TEE custody.
+
+        Returns:
+            The validated settings instance.
+
+        Raises:
+            ValueError: If local custody is selected without a usable seed.
+        """
+        if self.use_local_wallet:
+            if not self.wallet_seed:
+                raise ValueError(
+                    "wallet_seed is required when use_local_wallet is True. "
+                    "Either set WALLET_SEED, or set USE_LOCAL_WALLET=false to "
+                    "use CDP MPC custody (which needs no local seed)."
+                )
+        elif self.wallet_seed:
+            # Not fatal, but the whole point of MPC custody is that no seed
+            # exists on this machine.
+            print(
+                "⚠️  WALLET_SEED is set but USE_LOCAL_WALLET=false. The seed is "
+                "unused in CDP MPC mode -- remove it so no key material sits in "
+                "this environment."
+            )
+
+        return self
 
     @field_validator("premium_rpc_enabled")
     @classmethod

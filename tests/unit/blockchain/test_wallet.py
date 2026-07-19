@@ -26,17 +26,20 @@ def mock_config():
 
 @pytest.fixture
 def mock_wallet_provider():
-    """Mock CDP wallet provider instance.
+    """Mock wallet provider conforming to the WalletProvider ABC.
 
-    The real ``CdpEvmWalletProvider`` exposes ``get_address`` / ``get_balance``
-    as *synchronous* methods (the source calls them without ``await``), so these
-    are plain ``Mock``s — an ``AsyncMock`` would return an un-awaited coroutine
-    that the source then fails to convert. ``get_balance`` takes NO arguments and
-    returns the native balance in WEI, so the mock returns 1.5 ETH as wei.
+    ``get_address`` / ``get_balance`` are *synchronous* (the source calls them
+    without ``await``), so these are plain ``Mock``s — an ``AsyncMock`` would
+    return an un-awaited coroutine the source then fails to convert.
+
+    Per the ABC contract (src/wallet/base_provider.py), ``get_balance`` takes a
+    token symbol and returns WHOLE TOKEN UNITS. Providers wrapping
+    wei-denominated backends scale internally, so the mock returns 1.5, not
+    1.5e18.
     """
     provider = Mock()
     provider.get_address = Mock(return_value="0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb44")
-    provider.get_balance = Mock(return_value=1_500_000_000_000_000_000)  # 1.5 ETH in wei
+    provider.get_balance = Mock(return_value=Decimal("1.5"))  # whole ETH
     provider.export = Mock(return_value={"encrypted": "wallet_data"})
     return provider
 
@@ -87,21 +90,24 @@ async def test_get_balance_success(mock_config, mock_wallet_provider):
     balance = await wallet_manager.get_balance("eth")
 
     assert balance == Decimal("1.5")
-    # Real CdpEvmWalletProvider.get_balance takes no arguments.
-    mock_wallet_provider.get_balance.assert_called_once_with()
+    # Per the WalletProvider ABC, get_balance takes the token symbol.
+    mock_wallet_provider.get_balance.assert_called_once_with("ETH")
 
 
 @pytest.mark.asyncio
-async def test_get_balance_eth_converts_wei_to_eth(mock_config):
-    """Regression: ETH balance path matches the real CDP provider surface.
+async def test_get_balance_eth_does_not_rescale_provider_value(mock_config):
+    """Regression (WS7): the manager must NOT re-scale the provider's balance.
 
-    ``CdpEvmWalletProvider.get_balance`` is synchronous, takes no arguments, and
-    returns wei. ``get_balance('ETH')`` must call it with no args and convert
-    wei -> ETH (÷1e18), not treat the raw wei value as ETH.
+    Per src/wallet/base_provider.py, providers return WHOLE TOKEN UNITS and
+    scale wei internally. The manager previously divided the returned value by
+    1e18 a second time, which was correct only for a wei-returning provider and
+    under-reported LocalWalletProvider's balance by a factor of 1e18.
+
+    A 2 ETH balance must surface as exactly 2 -- not 2e-18.
     """
     provider = Mock()
     provider.get_address = Mock(return_value="0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb44")
-    provider.get_balance = Mock(return_value=2_000_000_000_000_000_000)  # 2 ETH in wei
+    provider.get_balance = Mock(return_value=Decimal("2"))  # whole ETH
 
     wallet_manager = WalletManager(mock_config)
     wallet_manager.wallet_provider = provider
@@ -109,7 +115,7 @@ async def test_get_balance_eth_converts_wei_to_eth(mock_config):
     balance = await wallet_manager.get_balance("ETH")
 
     assert balance == Decimal("2")
-    provider.get_balance.assert_called_once_with()
+    provider.get_balance.assert_called_once_with("ETH")
 
 
 @pytest.mark.asyncio
@@ -229,14 +235,45 @@ async def test_build_transaction_exceeds_limits(mock_config, mock_wallet_provide
 
 @pytest.mark.asyncio
 async def test_export_wallet_data_not_implemented(mock_config, mock_wallet_provider):
-    """Wallet export is intentionally unimplemented (CDP AgentKit exposes no export)."""
+    """Wallet export is intentionally unimplemented.
+
+    The CDP SDK does expose export_account(), but extracting a key from MPC/TEE
+    custody would reintroduce the plaintext-key exposure that custody exists to
+    prevent. This must stay a deliberate refusal, not a TODO.
+    """
     wallet_manager = WalletManager(mock_config)
     wallet_manager.wallet_provider = mock_wallet_provider
     wallet_manager.address = "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb4"
 
     # Bypass confirmation; the export path must raise NotImplementedError.
-    with pytest.raises(NotImplementedError, match="not yet implemented"):
+    with pytest.raises(NotImplementedError, match="intentionally not implemented"):
         await wallet_manager.export_wallet_data(require_confirmation=False)
+
+
+class TestFormatTxHash:
+    """Regression (WS7): tx hashes must be canonical 0x-prefixed strings.
+
+    hexbytes >= 1.0 returns an UNPREFIXED string from .hex(). The recorded
+    hash flows into the audit trail, the database, operator logs and
+    ChainMonitor, so an unprefixed value breaks explorer links and receipt
+    lookups. This affected the live local-wallet path, not just CDP.
+    """
+
+    def test_hexbytes_gets_prefix(self):
+        """HexBytes input yields a 0x-prefixed string."""
+        from hexbytes import HexBytes
+
+        result = WalletManager._format_tx_hash(HexBytes("0x" + "ab" * 32))
+
+        assert result == "0x" + "ab" * 32
+
+    def test_already_prefixed_string_unchanged(self):
+        """An already-prefixed string is not double-prefixed."""
+        assert WalletManager._format_tx_hash("0xdeadbeef") == "0xdeadbeef"
+
+    def test_unprefixed_string_gets_prefix(self):
+        """A bare hex string gains the prefix."""
+        assert WalletManager._format_tx_hash("deadbeef") == "0xdeadbeef"
 
 
 @pytest.mark.asyncio
