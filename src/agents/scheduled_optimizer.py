@@ -498,9 +498,28 @@ class ScheduledOptimizer:
 
         if self.position_tracker:
             try:
-                # Get active positions from position tracker (async call)
-                logger.info("🔍 DEBUG: Calling position_tracker.get_current_positions()")
-                active_positions = await self.position_tracker.get_current_positions()
+                # Get active positions for the CURRENT wallet only.
+                # SECURITY: without the wallet filter this loads every active
+                # row regardless of address, so stale positions belonging to a
+                # different/old wallet would drive rebalance decisions (and real
+                # withdraw attempts) against funds this wallet does not hold.
+                # See src/data/position_tracker.py get_current_positions.
+                current_wallet = self.wallet_manager.address
+                if not current_wallet:
+                    # Fail closed: without a known wallet we must NOT fall back
+                    # to loading every position (that is the bug this guards
+                    # against). Treat as no positions.
+                    logger.warning(
+                        "No active wallet address; skipping position load to avoid "
+                        "acting on positions from another wallet."
+                    )
+                    return {}
+                logger.info(
+                    f"🔍 DEBUG: Calling get_current_positions(wallet_address={current_wallet})"
+                )
+                active_positions = await self.position_tracker.get_current_positions(
+                    wallet_address=current_wallet
+                )
                 logger.info(f"🔍 DEBUG: Got {len(active_positions)} active positions from database")
 
                 # Log details of each position

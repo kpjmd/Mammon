@@ -10,11 +10,26 @@ ColdWalletStub) were removed — they were never wired into the live path. The
 two behaviors worth keeping (auto-pause on cumulative-limit breach, hot-balance
 cap) were ported into the live WalletManager + ScheduledOptimizer. This module
 is retained because its config/enum types are still imported by the transaction
-validator, spending limits, and the approval server. Full tier isolation is
-deferred to the planned CDP MPC custody migration.
+validator, spending limits, and the approval server.
+
+STATUS: Full tier isolation is still NOT implemented. This module remains
+types-only -- no tier is ever selected for a real transaction.
+
+The CDP MPC custody migration (WS7) has now landed and deliberately scoped tier
+isolation OUT: it migrated the single hot account to persistent MPC custody
+(src/wallet/cdp_mpc_provider.py) without touching tiering. Real tier isolation
+is deferred to a follow-up workstream, where each tier would map to its own
+named CDP MPC account (e.g. mammon-hot / mammon-warm), which is now
+straightforward since accounts are addressed by name.
+
+Two known hazards to fix when that work happens:
+- `Settings` tier fields (config.py) and this module's `_load_from_env` are two
+  parallel, unconnected config paths for the same knobs.
+- `contract_whitelist.RiskLevel` and this module's `RiskLevel` are distinct
+  enum classes with overlapping member names, so they never compare equal.
 
 Security Note: Seed phrases should NEVER be stored in filesystem.
-Use environment variable injection at runtime.
+Prefer CDP MPC custody (USE_LOCAL_WALLET=false), where no seed exists at all.
 """
 
 from dataclasses import dataclass, field

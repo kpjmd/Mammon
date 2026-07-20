@@ -27,14 +27,21 @@ class WalletProvider(ABC):
         pass
 
     @abstractmethod
-    def get_balance(self, token: str = "eth") -> Decimal:
+    def get_balance(self, token: str = "ETH") -> Decimal:
         """Get balance for a specific token.
 
         Args:
-            token: Token symbol (default: "eth")
+            token: Token symbol, case-insensitive (default: "ETH")
 
         Returns:
-            Balance as Decimal
+            Balance in WHOLE TOKEN UNITS as a Decimal -- e.g. ETH, not wei;
+            USDC, not its 6-decimal base unit.
+
+        Note:
+            The whole-unit contract is deliberate and load-bearing. Providers
+            wrapping wei-denominated APIs (CDP, raw web3) MUST do the scaling
+            themselves rather than leaking base units to callers. Callers must
+            NOT re-scale the returned value.
         """
         pass
 
@@ -72,6 +79,15 @@ class WalletProvider(ABC):
 
         Returns:
             Next nonce value
+
+        Raises:
+            NotImplementedError: For custodial providers that assign nonces
+                server-side (e.g. CDP MPC Server Wallets).
+
+        Note:
+            Local-signing concern only. Providers whose backend owns nonce
+            assignment raise NotImplementedError rather than guessing a value
+            the backend will ignore.
         """
         pass
 
@@ -80,5 +96,9 @@ class WalletProvider(ABC):
         """Reset nonce tracking to sync with chain state.
 
         Call this if a transaction fails to prevent nonce gaps.
+
+        Raises:
+            NotImplementedError: For custodial providers that assign nonces
+                server-side. See get_nonce.
         """
         pass

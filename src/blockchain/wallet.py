@@ -5,17 +5,12 @@ Supports both CDP wallet provider and local wallet provider.
 """
 
 import asyncio
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional
 from decimal import Decimal
 from datetime import datetime
-from coinbase_agentkit import (
-    AgentKit,
-    AgentKitConfig,
-    CdpEvmWalletProvider,
-    CdpEvmWalletProviderConfig,
-)
 from src.wallet.base_provider import WalletProvider
 from src.wallet.local_wallet_provider import LocalWalletProvider
+from src.wallet.cdp_mpc_provider import CdpMpcWalletProvider
 from src.security.limits import SpendingLimits
 from src.security.audit import AuditLogger, AuditEventType, AuditSeverity
 from src.security.approval import ApprovalManager, ApprovalStatus
@@ -78,8 +73,10 @@ class WalletManager:
         """
         self.config = config
         self.use_local_wallet = config.get("use_local_wallet", True)
-        self.agent_kit: Optional[AgentKit] = None
-        self.wallet_provider: Optional[Union[WalletProvider, CdpEvmWalletProvider]] = None
+        # Every provider now implements the WalletProvider ABC -- the previous
+        # Union with CdpEvmWalletProvider existed only because AgentKit's
+        # provider did not satisfy the interface.
+        self.wallet_provider: Optional[WalletProvider] = None
         self.address: Optional[str] = None
         self.network = config.get("network", "base-sepolia")
         self.dry_run_mode = config.get("dry_run_mode", True)
@@ -188,33 +185,68 @@ class WalletManager:
 
         logger.info(f"✅ Local wallet initialized: {self.address}")
 
+    @staticmethod
+    def _format_tx_hash(tx_hash: Any) -> str:
+        """Normalize a provider tx hash to a canonical 0x-prefixed string.
+
+        Args:
+            tx_hash: Hash as returned by a WalletProvider (typically HexBytes).
+
+        Returns:
+            The hash as a 0x-prefixed lowercase hex string.
+
+        Note:
+            hexbytes >= 1.0 (installed: 1.2.1) returns an UNPREFIXED string
+            from ``.hex()``, unlike 0.x. Without re-adding the prefix, the hash
+            recorded in the audit trail and database, logged to the operator,
+            and handed to ChainMonitor is non-canonical -- block explorer links
+            break and receipt lookups get a malformed hash.
+        """
+        formatted = tx_hash.hex() if hasattr(tx_hash, "hex") else str(tx_hash)
+        if not formatted.startswith("0x"):
+            formatted = f"0x{formatted}"
+        return formatted
+
     async def _initialize_cdp_wallet(self) -> None:
-        """Initialize CDP-managed wallet using AgentKit.
+        """Initialize persistent CDP MPC Server Wallet custody.
+
+        Keys are custodied in Coinbase's TEE and never exist on this machine.
+        The account is resolved by a stable name, so the address is identical
+        across runs.
+
+        Note:
+            This deliberately does NOT use coinbase-agentkit's
+            CdpEvmWalletProvider. That provider mints a new EOA whenever its
+            optional ``address`` field is unset (the cause of MAMMON's stranded
+            wallets) and drops EIP-1559 fee fields on send, which would
+            silently void the gas-price cap enforced in execute_transaction.
+            See src/wallet/cdp_mpc_provider.py.
 
         Raises:
-            ValueError: If CDP credentials are invalid
+            ValueError: If CDP credentials are invalid, the network is
+                unsupported, or the resolved address fails the expected-address
+                check.
         """
-        # Create wallet provider configuration
-        wallet_config = CdpEvmWalletProviderConfig(
+        settings = get_settings()
+        account_name = self.config.get("cdp_account_name") or settings.cdp_account_name
+        expected_address = self.config.get("cdp_expected_address") or settings.cdp_expected_address
+
+        logger.info(f"Initializing CDP MPC wallet for network: {self.network}")
+
+        self.wallet_provider = CdpMpcWalletProvider(
             api_key_id=self.config.get("cdp_api_key"),
             api_key_secret=self.config.get("cdp_api_secret"),
             wallet_secret=self.config.get("cdp_wallet_secret"),
-            network_id=self.network,
+            network=self.network,
+            web3=get_web3(self.network, config=settings),
+            account_name=account_name,
+            expected_address=expected_address,
+            config=self.config,
         )
 
-        logger.info(f"Initializing CDP wallet for network: {self.network}")
-
-        # Create wallet provider
-        self.wallet_provider = CdpEvmWalletProvider(wallet_config)
-
-        # Initialize AgentKit with wallet provider
-        agentkit_config = AgentKitConfig(wallet_provider=self.wallet_provider)
-        self.agent_kit = AgentKit(agentkit_config)
-
-        # Get wallet address
         self.address = self.wallet_provider.get_address()
 
-        logger.info(f"✅ CDP wallet initialized: {self.address}")
+        logger.info(f"✅ CDP MPC wallet initialized: {self.address}")
 
     async def get_balance(self, token: str = "ETH") -> Decimal:
         """Get wallet balance for a specific token.
@@ -234,12 +266,12 @@ class WalletManager:
         try:
             token_upper = token.upper()
 
-            # ETH balance via CDP wallet provider.
-            # The real CdpEvmWalletProvider.get_balance is SYNCHRONOUS, takes NO
-            # args, and returns the native balance in WEI — convert wei -> ETH.
+            # ETH balance via the wallet provider.
+            # Per the WalletProvider contract (src/wallet/base_provider.py),
+            # get_balance returns WHOLE TOKEN UNITS -- providers wrapping
+            # wei-denominated backends scale internally. Do NOT re-scale here.
             if token_upper == "ETH":
-                balance_wei = self.wallet_provider.get_balance()
-                balance_decimal = Decimal(str(balance_wei)) / Decimal(10**18)
+                balance_decimal = Decimal(str(self.wallet_provider.get_balance(token_upper)))
                 logger.debug(f"Balance for {token}: {balance_decimal}")
                 return balance_decimal
 
@@ -380,13 +412,16 @@ class WalletManager:
                 logger.info("Wallet export cancelled by user")
                 raise ValueError("Export cancelled by user")
 
-        # NOTE: CDP AgentKit CdpEvmWalletProvider does not expose an export() method
-        # This functionality would require direct CDP API calls
-        # TODO Phase 2B: Implement wallet export via CDP REST API
+        # NOTE: the CDP SDK does expose cdp.evm.export_account(), but it is
+        # deliberately NOT wired up here. Exporting extracts the private key
+        # from TEE custody, which reintroduces exactly the plaintext-key
+        # exposure that MPC custody exists to eliminate. Any future export path
+        # needs its own security review, not a convenience wrapper.
         raise NotImplementedError(
-            "Wallet export is not yet implemented. "
-            "CDP AgentKit does not expose wallet export functionality. "
-            "This requires direct CDP API integration."
+            "Wallet export is intentionally not implemented. Extracting a key "
+            "from CDP MPC/TEE custody would defeat the purpose of custodying "
+            "it there. If you genuinely need this, implement it deliberately "
+            "with a security review."
         )
 
     async def is_connected(self) -> bool:
@@ -1089,13 +1124,13 @@ class WalletManager:
 
             logger.info(f"✅ Spending limits checked and recorded: ${amount_usd}")
 
-            # Send via CDP wallet provider
-            # NOTE: CDP AgentKit handles signing and sending internally
-            # NOTE: send_transaction is synchronous, not async
+            # Send via the active wallet provider (local signing or CDP MPC).
+            # NOTE: send_transaction is synchronous per the WalletProvider ABC.
+            # Both providers sign and broadcast atomically, so the capped fee
+            # fields in tx_params are what actually reach the chain.
             tx_hash_bytes = self.wallet_provider.send_transaction(tx_params)
 
-            # Convert HexBytes to hex string for JSON serialization
-            tx_hash = tx_hash_bytes.hex() if hasattr(tx_hash_bytes, 'hex') else str(tx_hash_bytes)
+            tx_hash = self._format_tx_hash(tx_hash_bytes)
 
             logger.info(f"✅ Transaction submitted: {tx_hash}")
 

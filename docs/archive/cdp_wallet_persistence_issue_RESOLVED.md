@@ -1,7 +1,46 @@
 # CDP Wallet Persistence Issue & Solutions
 
 **Date**: 2025-01-09
-**Status**: 🔴 **BLOCKING ISSUE**
+**Status**: ✅ **RESOLVED (WS7)** — see correction below
+
+---
+
+> ## ⚠️ CORRECTION (WS7, CDP MPC custody migration)
+>
+> **The "Root Cause" section below is wrong.** It is preserved for history, but
+> do not act on it.
+>
+> **What it claimed:** the CDP API cannot load a wallet by address, only by
+> wallet ID.
+>
+> **What is actually true**, verified against the installed
+> `coinbase-agentkit` 0.7.4 and `cdp-sdk` 1.33.2:
+>
+> 1. `cdp.evm.get_account(address=...)` **does** exist, and AgentKit already
+>    calls it (`cdp_evm_wallet_provider.py:67-73`).
+> 2. AgentKit branches on its optional `CdpEvmWalletProviderConfig.address`
+>    field. When that field is **unset**, it calls `create_account()` — minting
+>    a brand-new EOA on every run.
+> 3. MAMMON never populated that field. **That** is the real cause of the 16+
+>    wallets and the stranded funds — a missing config value, not an API
+>    limitation.
+> 4. Better still, `cdp.evm.get_or_create_account(name=...)`
+>    (`evm_client.py:420`) resolves a stable account by **name**, so nothing
+>    has to be persisted locally at all. AgentKit never calls it.
+>
+> **Resolution:** WS7 added `src/wallet/cdp_mpc_provider.py`, a first-party
+> provider built directly on `cdp-sdk` that resolves the account by name via
+> `get_or_create_account`. Same name → same address, every run. It bypasses
+> AgentKit entirely, because AgentKit's `send_transaction` drops the EIP-1559
+> fee fields and would silently void MAMMON's gas-price cap.
+>
+> **The interim fix recorded in `RESOLUTION_NOTE.md` ("Solution A: local wallet
+> with seed phrase") was a workaround, not a fix.** It put a plaintext seed on
+> the machine, which led to the 2025-12-02 wallet drain. Persistent MPC custody
+> supersedes it.
+>
+> To verify persistence yourself: `poetry run python scripts/cdp_show_account.py`
+> twice — the address must be identical.
 
 ---
 
