@@ -22,12 +22,12 @@ jobs:
       # imported from the repo root. Make that explicit for the test runner.
       PYTHONPATH: .
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Poetry
         run: pipx install poetry
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: poetry
