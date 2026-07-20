@@ -155,6 +155,11 @@ class PositionTracker:
             if not position:
                 raise ValueError(f"Position {position_id} not found")
 
+            # Capture the entry value BEFORE overwriting it, otherwise the ROI
+            # calc below reads the just-written final value as the entry value
+            # and always yields 0.
+            entry_value_usd = position.value_usd
+
             position.status = "closed"
             position.closed_at = datetime.utcnow()
             position.value_usd = actual_value_usd
@@ -164,18 +169,22 @@ class PositionTracker:
             if days_held == 0:
                 days_held = 1  # Minimum 1 day
 
-            # Calculate actual ROI if not provided
+            # Calculate actual ROI if not provided. Guard on the ENTRY value
+            # being non-zero (not the final value): a position closed at $0 --
+            # e.g. a drained or fully-exited position -- is a legitimate -100%
+            # close, not a reason to leave roi undefined.
             roi = actual_roi
-            if roi is None and position.value_usd:
-                initial_value = Decimal(str(position.value_usd))  # Entry value
+            if roi is None and entry_value_usd:
+                initial_value = Decimal(str(entry_value_usd))
                 final_value = actual_value_usd
                 roi = ((final_value - initial_value) / initial_value) * 100
 
             self.session.commit()
 
+            roi_str = f"{roi:.4f}%" if roi is not None else "n/a"
             logger.info(
                 f"🏁 Closed position: {position.protocol} {position.token} "
-                f"(held {days_held} days, ROI: {roi:.4f}%)"
+                f"(held {days_held} days, ROI: {roi_str})"
             )
 
             return {
@@ -185,7 +194,7 @@ class PositionTracker:
                 "days_held": days_held,
                 "entry_apy": position.entry_apy,
                 "actual_roi": roi,
-                "entry_value_usd": position.value_usd,
+                "entry_value_usd": entry_value_usd,
                 "final_value_usd": actual_value_usd,
             }
 
