@@ -15,7 +15,7 @@ from datetime import datetime, UTC, timedelta
 from decimal import Decimal
 import asyncio
 
-from src.agents.yield_scanner import YieldScannerAgent
+from src.agents.yield_scanner import YieldScannerAgent, YieldOpportunity
 from src.agents.optimizer import OptimizerAgent
 from src.agents.risk_assessor import RiskAssessorAgent
 from src.strategies.base_strategy import RebalanceRecommendation
@@ -136,6 +136,11 @@ class ScheduledOptimizer:
         self.min_profit_usd = config.get("min_profit_usd", Decimal("10"))
         self.dry_run_mode = config.get("dry_run_mode", False)
         self.target_token = config.get("target_token", "USDC")
+        # Reconcile the positions table from on-chain balances at the start of
+        # every cycle so the rebalance read path reflects funds moved outside
+        # the loop (e.g. a manual protocol exit). Post-execution reconciles run
+        # regardless; this flag only governs the extra cycle-start sweep.
+        self.reconcile_on_read = config.get("reconcile_on_read", True)
 
         # Resilience (WS3): latching circuit breaker + liveness heartbeat
         self.breaker = CycleCircuitBreaker(
@@ -324,6 +329,12 @@ class ScheduledOptimizer:
             await self._alert_stranded_intents()
             await self._check_balance_cap()
 
+            # 0. Reconcile the positions table with on-chain truth before the
+            # read below, so decisions see funds moved outside the loop (e.g. a
+            # manual protocol exit) and positions deployed in a prior cycle.
+            if self.reconcile_on_read:
+                await self.reconcile_positions()
+
             # 1. Get current positions
             current_positions = await self._get_current_positions()
 
@@ -448,6 +459,12 @@ class ScheduledOptimizer:
                         )
 
                         logger.info(f"✅ Rebalance successful! Gas cost: ${execution.total_gas_cost_usd}")
+
+                        # Record the new position and close the drained source
+                        # by reconciling both protocols against on-chain truth.
+                        await self.reconcile_positions(
+                            [rec.from_protocol, rec.to_protocol]
+                        )
                     else:
                         self.status.total_opportunities_skipped += 1
                         logger.warning(f"❌ Rebalance failed: {execution.error}")
@@ -561,6 +578,149 @@ class ScheduledOptimizer:
         # No position tracker or error - return empty positions
         logger.warning("⚠️  No position tracker available or error occurred")
         return {}
+
+    async def reconcile_positions(
+        self,
+        protocols: Optional[List[str]] = None,
+        opportunities: Optional[List[YieldOpportunity]] = None,
+    ) -> None:
+        """Sync the positions table with on-chain balances for the current wallet.
+
+        Reads each in-scope pool's on-chain balance and upserts a Position row
+        for anything the wallet actually holds, then closes any previously
+        tracked position the wallet no longer holds on-chain (e.g. the source
+        side of a completed rebalance).
+
+        This is the ONLY writer of the positions table on the live path, so the
+        rebalance read path (`_get_current_positions`) reflects real deployed
+        capital instead of a permanently empty table.
+
+        Best-effort: any failure is logged and swallowed — a bookkeeping error
+        must never fail an optimization cycle. Skipped entirely in dry-run (the
+        loop must not mutate persistent state during a simulation).
+
+        Note on RPC lag: the live executor waits on receipts + a verification
+        step before reporting success, so txs are mined by the time we read
+        here; a lagging read-replica is still self-healing — a target that
+        momentarily reads 0 is simply recorded next cycle, and a source that
+        still reads >0 stays active one extra cycle rather than being wrongly
+        closed.
+
+        Args:
+            protocols: If given, only reconcile these protocol names (scopes the
+                sweep to the protocols an execution just touched). None = all.
+            opportunities: Pre-fetched scan results to reuse instead of
+                re-scanning (e.g. the single opportunity just deployed to).
+        """
+        # Dry-run and missing-tracker are hard no-ops (single chokepoint).
+        if self.dry_run_mode or not self.position_tracker:
+            return
+
+        try:
+            wallet = self.wallet_manager.address
+            if not wallet:
+                # Fail closed: without a known wallet we cannot scope reads or
+                # writes to the right address. Mirrors _get_current_positions.
+                logger.warning(
+                    "reconcile_positions: no active wallet address; skipping."
+                )
+                return
+
+            oracle = self.yield_scanner.price_oracle
+
+            scope: Optional[set] = (
+                {p for p in protocols if p} if protocols is not None else None
+            )
+
+            # Snapshot what we currently believe is active, so we can close
+            # anything that has since disappeared on-chain.
+            tracked = await self.position_tracker.get_current_positions(
+                wallet_address=wallet
+            )
+            tracked_by_key: Dict[Tuple[str, str, str], Any] = {}
+            for snap in tracked:
+                if scope is not None and snap.protocol not in scope:
+                    continue
+                tracked_by_key[(snap.protocol, snap.pool_id, snap.token)] = snap
+
+            # Enumerate in-scope pools (reuse a passed-in scan when available).
+            opps = opportunities
+            if opps is None:
+                opps = await self.yield_scanner.scan_all_protocols()
+            if scope is not None:
+                opps = [o for o in opps if o.protocol in scope]
+
+            proto_by_name = {p.name: p for p in self.yield_scanner.protocols}
+
+            # `seen`: pools read with a positive balance (recorded/upserted).
+            # `checked`: pools whose balance we actually READ this sweep (any
+            # value). We only close tracked positions we confirmed are empty —
+            # a pool absent from `checked` (transient scan/RPC failure for its
+            # protocol) is left active rather than falsely closed.
+            seen: set = set()
+            checked: set = set()
+            for opp in opps:
+                proto_obj = proto_by_name.get(opp.protocol)
+                if proto_obj is None:
+                    continue
+                token = opp.tokens[0] if opp.tokens else self.target_token
+                try:
+                    balance = await proto_obj.get_user_balance(opp.pool_id, wallet)
+                except Exception as e:
+                    logger.warning(
+                        f"reconcile_positions: failed to read balance "
+                        f"{opp.protocol}/{opp.pool_id}: {e}"
+                    )
+                    continue
+                key = (opp.protocol, opp.pool_id, token)
+                checked.add(key)
+                if not (balance and balance > 0):
+                    continue
+                try:
+                    price = await oracle.get_price(token)
+                    value_usd = balance * price
+                    await self.position_tracker.record_position(
+                        wallet_address=wallet,
+                        protocol=opp.protocol,
+                        pool_id=opp.pool_id,
+                        token=token,
+                        amount=balance,
+                        value_usd=value_usd,
+                        current_apy=opp.apy,
+                    )
+                    seen.add(key)
+                except Exception as e:
+                    logger.warning(
+                        f"reconcile_positions: failed to record "
+                        f"{opp.protocol}/{opp.pool_id}: {e}"
+                    )
+                    continue
+
+            # Close positions we CONFIRMED the wallet no longer holds on-chain
+            # (read this sweep, balance 0). Close at the LAST TRACKED value (not
+            # $0): funds that were rebalanced out were moved, not lost — a $0
+            # close would book a bogus -100% ROI.
+            for key, snap in tracked_by_key.items():
+                if key in seen or key not in checked:
+                    continue
+                position_id = (
+                    snap.metadata.get("position_id") if snap.metadata else None
+                )
+                if position_id is None:
+                    continue
+                try:
+                    await self.position_tracker.close_position(
+                        position_id=position_id,
+                        actual_value_usd=snap.value_usd or Decimal("0"),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"reconcile_positions: failed to close position "
+                        f"{position_id} ({snap.protocol}/{snap.pool_id}): {e}"
+                    )
+
+        except Exception as e:
+            logger.error(f"reconcile_positions failed: {e}", exc_info=True)
 
     async def _get_idle_capital(
         self, min_amount: Decimal = Decimal("10")
@@ -881,6 +1041,14 @@ class ScheduledOptimizer:
 
                     if is_recovery:
                         await self._mark_recovered(token)
+
+                    # Record the freshly deployed position from on-chain truth.
+                    # from_protocol is None here, so there is no source to close;
+                    # pass the known opportunity to avoid a redundant re-scan.
+                    await self.reconcile_positions(
+                        [best_opportunity.protocol],
+                        opportunities=[best_opportunity],
+                    )
                 else:
                     self.status.total_opportunities_skipped += 1
                     logger.warning(f"❌ Deployment failed: {execution.error}")
