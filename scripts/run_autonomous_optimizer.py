@@ -66,6 +66,7 @@ class AutonomousRunner:
         max_rebalances_per_day: int = 6,
         max_gas_per_day_usd: Decimal = Decimal("10"),
         dry_run: Optional[bool] = None,
+        max_deploy_usd: Optional[Decimal] = None,
     ):
         """Initialize the autonomous runner.
 
@@ -75,11 +76,14 @@ class AutonomousRunner:
             max_rebalances_per_day: Maximum rebalances allowed per day
             max_gas_per_day_usd: Maximum gas spend per day in USD
             dry_run: If True, simulate transactions only. If None, read from .env DRY_RUN_MODE
+            max_deploy_usd: Optional per-deployment USD ceiling on idle-capital
+                deployment. None deploys the full idle balance.
         """
         self.duration_hours = duration_hours
         self.scan_interval_hours = scan_interval_hours
         self.max_rebalances_per_day = max_rebalances_per_day
         self.max_gas_per_day_usd = max_gas_per_day_usd
+        self.max_deploy_usd = max_deploy_usd
 
         # Load settings first to get .env DRY_RUN_MODE
         self.settings = get_settings()
@@ -154,6 +158,9 @@ class AutonomousRunner:
             "aerodrome_min_tvl_usd": self.settings.aerodrome_min_tvl_usd,
             "aerodrome_min_volume_24h": self.settings.aerodrome_min_volume_24h,
             "aerodrome_token_whitelist": self.settings.aerodrome_token_whitelist,
+            # Optional per-deployment USD ceiling for idle capital (bounds a
+            # live test without touching MAX_TRANSACTION_VALUE_USD).
+            "max_deploy_usd": self.max_deploy_usd,
         }
         logger.info("✅ STEP 1: Configuration built successfully")
 
@@ -168,6 +175,8 @@ class AutonomousRunner:
         print(f"Scan Interval: {self.scan_interval_hours} hours")
         print(f"Max Rebalances/Day: {self.max_rebalances_per_day}")
         print(f"Max Gas/Day: ${self.max_gas_per_day_usd}")
+        if self.max_deploy_usd is not None:
+            print(f"Max Deploy/Deployment: ${self.max_deploy_usd}")
 
         # Initialize components
         print("\nInitializing components...")
@@ -695,6 +704,14 @@ async def main():
         default=None,
         help="Enable dry-run mode (simulates transactions). If not specified, reads from .env DRY_RUN_MODE"
     )
+    parser.add_argument(
+        "--max-deploy-usd",
+        type=float,
+        default=None,
+        help="Cap a single idle-capital deployment to this USD amount "
+             "(default: deploy the full idle balance). Bounds a live test "
+             "without lowering MAX_TRANSACTION_VALUE_USD."
+    )
 
     args = parser.parse_args()
 
@@ -708,6 +725,11 @@ async def main():
         max_rebalances_per_day=args.max_rebalances,
         max_gas_per_day_usd=Decimal(str(args.max_gas)),
         dry_run=dry_run_arg,
+        max_deploy_usd=(
+            Decimal(str(args.max_deploy_usd))
+            if args.max_deploy_usd is not None
+            else None
+        ),
     )
 
     # Setup signal handler for graceful shutdown

@@ -141,6 +141,14 @@ class ScheduledOptimizer:
         # the loop (e.g. a manual protocol exit). Post-execution reconciles run
         # regardless; this flag only governs the extra cycle-start sweep.
         self.reconcile_on_read = config.get("reconcile_on_read", True)
+        # Optional hard ceiling (USD) on a single idle-capital deployment, so a
+        # live run can be bounded without lowering MAX_TRANSACTION_VALUE_USD.
+        # None = deploy the full idle balance (default, backward-compatible).
+        # Applies to the USDC/stablecoin idle path where the token amount ≈ USD.
+        _max_deploy = config.get("max_deploy_usd")
+        self.max_deploy_usd: Optional[Decimal] = (
+            Decimal(str(_max_deploy)) if _max_deploy is not None else None
+        )
 
         # Resilience (WS3): latching circuit breaker + liveness heartbeat
         self.breaker = CycleCircuitBreaker(
@@ -914,6 +922,18 @@ class ScheduledOptimizer:
 
         for token, amount in idle_capital.items():
             is_recovery = token.upper() in recovery_tokens
+
+            # Bound a single deployment to max_deploy_usd when set. `amount` is
+            # the idle token balance; on the USDC/stablecoin idle path that is
+            # ~1:1 with USD, so the USD ceiling applies directly. Deploys only
+            # the capped slice and leaves the remainder idle for a later cycle.
+            if self.max_deploy_usd is not None and amount > self.max_deploy_usd:
+                logger.info(
+                    f"Capping idle {token} deployment: {amount} → "
+                    f"{self.max_deploy_usd} (max_deploy_usd)"
+                )
+                amount = self.max_deploy_usd
+
             try:
                 # Find best yield for this token
                 best_opportunity = await self.yield_scanner.find_best_yield(
