@@ -301,6 +301,55 @@ class TestResilience:
         opt.yield_scanner.scan_all_protocols.assert_awaited()
 
 
+class TestRetryOnLag:
+    async def test_retries_then_records_target(self, tmp_path):
+        # Target reads a stale 0 (RPC lag) then the real balance → recorded.
+        opp = _opp("Moonwell", "moonwell-usdc", apy="6")
+        opt, tracker = _make_optimizer(
+            tmp_path, opportunities=[opp], protocols=[_proto("Moonwell", "0")]
+        )
+        gub = AsyncMock(side_effect=[Decimal("0"), Decimal("25")])
+        opt.yield_scanner.protocols[0].get_user_balance = gub
+
+        await opt.reconcile_positions(
+            ["Moonwell"], expect_nonzero=["Moonwell"], retries=3, retry_delay_s=0
+        )
+
+        rows = await _active(tracker)
+        assert len(rows) == 1 and rows[0].value_usd == Decimal("25")
+        assert gub.call_count == 2  # first 0, retry got 25
+
+    async def test_no_retry_without_expect_nonzero(self, tmp_path):
+        # retries is ignored unless the protocol is in expect_nonzero.
+        opp = _opp("Moonwell", "moonwell-usdc")
+        opt, tracker = _make_optimizer(
+            tmp_path, opportunities=[opp], protocols=[_proto("Moonwell", "0")]
+        )
+        gub = AsyncMock(side_effect=[Decimal("0"), Decimal("25")])
+        opt.yield_scanner.protocols[0].get_user_balance = gub
+
+        await opt.reconcile_positions(["Moonwell"], retries=3, retry_delay_s=0)
+
+        assert await _active(tracker) == []
+        assert gub.call_count == 1  # read once, not retried
+
+    async def test_gives_up_after_retries(self, tmp_path):
+        # Persistent 0 → not recorded, read exactly retries+1 times.
+        opp = _opp("Moonwell", "moonwell-usdc")
+        opt, tracker = _make_optimizer(
+            tmp_path, opportunities=[opp], protocols=[_proto("Moonwell", "0")]
+        )
+        gub = AsyncMock(return_value=Decimal("0"))
+        opt.yield_scanner.protocols[0].get_user_balance = gub
+
+        await opt.reconcile_positions(
+            ["Moonwell"], expect_nonzero=["Moonwell"], retries=2, retry_delay_s=0
+        )
+
+        assert await _active(tracker) == []
+        assert gub.call_count == 3  # 1 initial + 2 retries
+
+
 class TestCycleIntegration:
     async def test_reconciled_target_visible_to_read_path(self, tmp_path):
         # After reconcile, _get_current_positions() aggregates the target by
