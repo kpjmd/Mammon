@@ -470,8 +470,12 @@ class ScheduledOptimizer:
 
                         # Record the new position and close the drained source
                         # by reconciling both protocols against on-chain truth.
+                        # Retry the just-funded target against RPC lag; the
+                        # source is expected to have gone to 0, so never retry it.
                         await self.reconcile_positions(
-                            [rec.from_protocol, rec.to_protocol]
+                            [rec.from_protocol, rec.to_protocol],
+                            expect_nonzero=[rec.to_protocol],
+                            retries=3,
                         )
                     else:
                         self.status.total_opportunities_skipped += 1
@@ -591,6 +595,9 @@ class ScheduledOptimizer:
         self,
         protocols: Optional[List[str]] = None,
         opportunities: Optional[List[YieldOpportunity]] = None,
+        expect_nonzero: Optional[List[str]] = None,
+        retries: int = 0,
+        retry_delay_s: float = 3.0,
     ) -> None:
         """Sync the positions table with on-chain balances for the current wallet.
 
@@ -609,16 +616,23 @@ class ScheduledOptimizer:
 
         Note on RPC lag: the live executor waits on receipts + a verification
         step before reporting success, so txs are mined by the time we read
-        here; a lagging read-replica is still self-healing — a target that
-        momentarily reads 0 is simply recorded next cycle, and a source that
-        still reads >0 stays active one extra cycle rather than being wrongly
-        closed.
+        here; but a load-balanced read-replica can still return a stale 0 for a
+        just-deposited pool. In the continuous loop the next cycle's reconcile
+        self-heals it, but a one-shot run has no next cycle — so callers that
+        just deposited pass `expect_nonzero`/`retries` to re-read the target a
+        few times before giving up. A source that still reads >0 stays active
+        one extra cycle rather than being wrongly closed.
 
         Args:
             protocols: If given, only reconcile these protocol names (scopes the
                 sweep to the protocols an execution just touched). None = all.
             opportunities: Pre-fetched scan results to reuse instead of
                 re-scanning (e.g. the single opportunity just deployed to).
+            expect_nonzero: Protocol names where a 0 balance read is treated as
+                RPC lag (we just deposited there) and retried up to `retries`
+                times. Never retry a source we expect to have gone to 0.
+            retries: Extra read attempts for `expect_nonzero` pools that read 0.
+            retry_delay_s: Delay between those retries.
         """
         # Dry-run and missing-tracker are hard no-ops (single chokepoint).
         if self.dry_run_mode or not self.position_tracker:
@@ -659,6 +673,7 @@ class ScheduledOptimizer:
                 opps = [o for o in opps if o.protocol in scope]
 
             proto_by_name = {p.name: p for p in self.yield_scanner.protocols}
+            expect = {p for p in (expect_nonzero or [])}
 
             # `seen`: pools read with a positive balance (recorded/upserted).
             # `checked`: pools whose balance we actually READ this sweep (any
@@ -672,17 +687,47 @@ class ScheduledOptimizer:
                 if proto_obj is None:
                     continue
                 token = opp.tokens[0] if opp.tokens else self.target_token
-                try:
-                    balance = await proto_obj.get_user_balance(opp.pool_id, wallet)
-                except Exception as e:
-                    logger.warning(
-                        f"reconcile_positions: failed to read balance "
-                        f"{opp.protocol}/{opp.pool_id}: {e}"
-                    )
+
+                # A just-deposited target may read a stale 0 on a lagging RPC
+                # replica; re-read it a few times before treating it as empty.
+                # Non-expected pools (sources, cycle-start sweeps) read once.
+                want_nonzero = opp.protocol in expect
+                attempts = (retries + 1) if want_nonzero else 1
+                balance = None
+                for attempt in range(attempts):
+                    try:
+                        balance = await proto_obj.get_user_balance(
+                            opp.pool_id, wallet
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"reconcile_positions: failed to read balance "
+                            f"{opp.protocol}/{opp.pool_id} "
+                            f"(attempt {attempt + 1}/{attempts}): {e}"
+                        )
+                        balance = None
+                    if balance and balance > 0:
+                        break
+                    if want_nonzero and attempt + 1 < attempts:
+                        logger.info(
+                            f"reconcile_positions: {opp.protocol}/{opp.pool_id} "
+                            f"read {balance}; expected a balance (likely RPC "
+                            f"lag), retrying in {retry_delay_s}s"
+                        )
+                        await asyncio.sleep(retry_delay_s)
+
+                if balance is None:
+                    # Never got a successful read — leave any tracked row alone.
                     continue
                 key = (opp.protocol, opp.pool_id, token)
                 checked.add(key)
-                if not (balance and balance > 0):
+                if not (balance > 0):
+                    if want_nonzero:
+                        logger.warning(
+                            f"reconcile_positions: {opp.protocol}/{opp.pool_id} "
+                            f"still 0 after {attempts} attempt(s); not recorded "
+                            f"this cycle (next reconcile will retry)."
+                        )
                     continue
                 try:
                     price = await oracle.get_price(token)
@@ -1065,9 +1110,12 @@ class ScheduledOptimizer:
                     # Record the freshly deployed position from on-chain truth.
                     # from_protocol is None here, so there is no source to close;
                     # pass the known opportunity to avoid a redundant re-scan.
+                    # Retry the just-funded target against RPC read-replica lag.
                     await self.reconcile_positions(
                         [best_opportunity.protocol],
                         opportunities=[best_opportunity],
+                        expect_nonzero=[best_opportunity.protocol],
+                        retries=3,
                     )
                 else:
                     self.status.total_opportunities_skipped += 1
