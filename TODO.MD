@@ -1,19 +1,103 @@
 # MAMMON Development Roadmap
 
-## Current Status: Phase 4 Sprint 2 ✅ COMPLETE - FIRST TESTNET REBALANCE SUCCESS! 🎉
+## Current Status: Phase 4 Sprint 4 ✅ COMPLETE - TIERED WALLET SECURITY READY! 🔐
 
-**Last Updated**: 2025-11-17
+**Last Updated**: 2025-12-13
 **Coverage**: >85% on new code
-**Tests**: 437 passing (430 previous + 7 new ScheduledOptimizer tests)
+**Tests**: 694+ tests (including new security components)
 **Protocols**: 4 (Aerodrome, Morpho Blue, Aave V3 ✅ PROVEN, Moonwell)
 **Real Data**: ALL protocols query Base mainnet + testnet ✅
-**Wallet**: `0x81A2933C185e45f72755B35110174D57b5E1FC88` (Local wallet with seed phrase)
+**Hot Wallet**: `0xF5Fec40E1fafa9e4382C872550d7C4944b5a1e65` (New secure wallet)
 **Network**: Base Sepolia (testnet) + Base Mainnet (data)
 **RPC Status**: Premium RPC at 50% rollout, 100% reliability, 25-70ms latency
-**HISTORIC ACHIEVEMENT**: ✅ FIRST AUTONOMOUS REBALANCE ON BASE SEPOLIA TESTNET!
-  - Approve TX: `0x5aadf4c3184bc4b9fe031ec6a1bab969152b9077e0d9eff50fa0cd03312d0097`
-  - Deposit TX: `0xd3dddce0386a380f8c5b6614ec4dcba139cff1b0f7e72f84d84f2ca9f4bf1aa6`
-  - Result: 10.000001 aBasSepUSDC earning yield on Aave V3!
+**SECURITY MILESTONE**: ✅ THREE-TIER WALLET SECURITY ARCHITECTURE COMPLETE!
+  - Tier 1 (HOT): Autonomous, $500/tx, $1000/day, auto-pause
+  - Tier 2 (WARM): Manual approval, $5000/tx, $10000/day, 24h timeout
+  - Tier 3 (COLD): Ledger hardware, unlimited, 168h approval
+  - EIP-7702 & Permit2 attack detection
+  - Contract whitelist with 10+ Base protocols
+
+---
+
+## Phase 5: Production Deployment 🚀 IN PROGRESS
+
+### Sprint 1: VPS Deployment & Moat Validation
+**Status**: Ready to deploy
+**Target**: DigitalOcean droplet with 48-hour validation test
+
+#### Pre-Deployment Checklist
+- [x] Generate new secure wallet (`0xF5Fec40E1fafa9e4382C872550d7C4944b5a1e65`)
+- [x] Tiered wallet security complete (Hot/Warm/Cold)
+- [x] Contract whitelist configured (USDC, Aave, Moonwell, etc.)
+- [x] Transaction validator (EIP-7702, Permit2 detection)
+- [x] VPS deployment scripts (`scripts/vps_deploy.sh`, `scripts/vps_start.sh`)
+- [x] Seed injection mechanism (environment variable, not stored on disk)
+- [x] Documentation updated
+
+#### Deployment Tasks
+- [ ] Create DigitalOcean droplet (Ubuntu 22.04, 2GB RAM)
+- [ ] Deploy code via `vps_deploy.sh` (no secrets)
+- [ ] Fund wallet ($100-200 USDC + $5-10 ETH for gas)
+- [ ] Start with seed injection via SSH
+- [ ] Run 48-hour moat validation test
+- [ ] Monitor via approval server dashboard
+
+#### Success Criteria
+- [ ] Autonomous operation for 48+ hours
+- [ ] No security incidents
+- [ ] Profitable rebalancing decisions
+- [ ] Auto-pause triggers correctly on limit breach
+- [ ] Unknown contracts blocked correctly
+
+---
+
+## Phase 4 Sprint 4: Tiered Wallet Security ✅ COMPLETE
+
+**Date Completed**: 2025-12-13
+**Status**: ALL COMPONENTS IMPLEMENTED
+
+### Achievements
+
+#### New Files Created (8 files)
+- [x] `src/wallet/tiered_config.py` - WalletTier enum, TierConfig, TierStatus (~280 lines)
+- [x] `src/security/contract_whitelist.py` - ContractWhitelist with 10+ Base contracts (~590 lines)
+- [x] `src/security/transaction_validator.py` - EIP-7702/Permit2/delegatecall detection (~600 lines)
+- [x] `src/wallet/hot_wallet_provider.py` - Tier 1 autonomous wallet (~470 lines)
+- [x] `src/wallet/warm_wallet_provider.py` - Tier 2 approval wallet (~420 lines)
+- [x] `src/api/approval_server.py` - FastAPI approval dashboard (~310 lines)
+- [x] `scripts/generate_new_wallet.py` - BIP-39 wallet generator
+- [x] `scripts/vps_deploy.sh` + `scripts/vps_start.sh` - VPS deployment
+
+#### Modified Files (3 files)
+- [x] `src/security/limits.py` - Added TierConfig support, weekly/monthly limits, auto-pause callback
+- [x] `src/security/audit.py` - Added 10 new security event types
+- [x] `src/blockchain/wallet.py` - Integrated TransactionValidator in build/execute path
+
+### Three-Tier Wallet Architecture
+
+| Tier | Max TX | Daily Limit | Balance Cap | Approval | Risk Levels |
+|------|--------|-------------|-------------|----------|-------------|
+| HOT  | $500   | $1,000      | $2,000      | None (auto) | LOW only |
+| WARM | $5,000 | $10,000     | $50,000     | 24h manual | LOW, MEDIUM |
+| COLD | Unlimited | Unlimited | Unlimited | 168h manual | LOW, MEDIUM, HIGH |
+
+### Security Features
+- **EIP-7702 Detection**: Blocks delegation authorization patterns
+- **Permit2 Monitoring**: Warns on Permit2 interactions, detects hidden approvals
+- **Contract Whitelist**: Only whitelisted contracts allowed (USDC, Aave, Moonwell, Aerodrome, etc.)
+- **Auto-Pause**: Hot wallet pauses itself on limit breach
+- **Audit Trail**: All security events logged with threat details
+
+### Approval Server
+- FastAPI server on port 8080
+- Bearer token authentication
+- Routes: `/approvals/pending`, `/approvals/{id}/approve`, `/approvals/{id}/reject`
+- Event-driven (no polling) - instant response on status change
+
+### Test Results
+- All security unit tests pass (36/36)
+- Contract whitelist validation working
+- Transaction validator blocking unknown contracts (expected behavior)
 
 ---
 
@@ -454,16 +538,12 @@ See `PHASE3_SPRINT3_PARTIAL_COMPLETE.md` for:
 
 ## Technical Debt & Architectural Issues
 
-### 🔴 CRITICAL: Approval Workflow Polling (Phase 2A)
+### ✅ RESOLVED: Approval Workflow Polling
 **File**: `src/security/approval.py`
-**Issue**: Uses polling (0.5s intervals) instead of event-driven pattern
-**Impact**:
-- Causes test timeouts
-- Blocks async event loop
-- Doesn't scale for concurrent approvals
-- Inefficient resource usage
+**Issue**: Was using polling (0.5s intervals) instead of event-driven pattern
+**Status**: ✅ FIXED in Phase 4 Sprint 4
 
-**Solution**: Refactor to use `asyncio.Event`:
+**Solution Implemented**:
 ```python
 class ApprovalRequest:
     def __init__(self, ...):
@@ -481,17 +561,15 @@ async def wait_for_approval(self, request, timeout_seconds=3600):
         return EXPIRED
 ```
 
-**Effort**: 2-3 hours
-**Priority**: Before production deployment
-**Status**: Documented, defer to Phase 2A
+**Result**: Instant response when approval status changes, no polling overhead.
 
-### ⚠️ Skipped Tests
-**File**: Tests removed due to polling timeout:
-- `tests/unit/blockchain/test_wallet_approval.py` (deleted)
+### ⚠️ Test Coverage Gaps
+**Files needing more tests**:
+- `tests/unit/security/test_limits.py` - Need tests for weekly/monthly limits
+- `tests/unit/wallet/test_warm_wallet.py` - Need approval workflow tests
+- `tests/unit/api/test_approval_server.py` - Need FastAPI endpoint tests
 
-**Note**: Approval workflow has excellent unit test coverage (33 tests).
-Integration tests were removed due to polling timeout issues.
-Will be restored after event-driven refactor in Phase 2A.
+**Note**: Core security tests pass (36/36). Additional test coverage recommended before mainnet.
 
 ---
 
