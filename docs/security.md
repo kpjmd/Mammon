@@ -13,6 +13,8 @@ MAMMON is built with security as the top priority. This document outlines our se
 4. ❌ Allow transactions without limits
 5. ❌ Ignore error conditions
 6. ❌ Run on mainnet without extensive testing
+7. ❌ Send transactions to unknown contracts
+8. ❌ Approve unlimited token allowances
 
 ### ALWAYS
 1. ✅ Validate all inputs
@@ -21,6 +23,190 @@ MAMMON is built with security as the top priority. This document outlines our se
 4. ✅ Log all critical operations
 5. ✅ Use type hints and validation
 6. ✅ Test on testnet first
+7. ✅ Use contract whitelist for all transactions
+8. ✅ Detect and block malicious transaction patterns
+
+---
+
+## Three-Tier Wallet Architecture
+
+MAMMON uses a three-tier wallet system to balance autonomy with security:
+
+### Tier 1: HOT Wallet (Autonomous)
+**Purpose**: Day-to-day autonomous operations
+**File**: `src/wallet/hot_wallet_provider.py`
+
+| Setting | Value |
+|---------|-------|
+| Max Transaction | $500 USD |
+| Daily Limit | $1,000 USD |
+| Max Balance | $2,000 USD |
+| Approval | None (autonomous) |
+| Risk Levels | LOW only |
+| Auto-Pause | Yes (on limit breach) |
+
+**Features**:
+- Fully autonomous operation
+- Automatic pause on spending limit breach
+- Only interacts with LOW-risk whitelisted contracts
+- Seed phrase injected at runtime (never stored on disk)
+
+### Tier 2: WARM Wallet (Manual Approval)
+**Purpose**: Larger transactions requiring human oversight
+**File**: `src/wallet/warm_wallet_provider.py`
+
+| Setting | Value |
+|---------|-------|
+| Max Transaction | $5,000 USD |
+| Daily Limit | $10,000 USD |
+| Max Balance | $50,000 USD |
+| Approval | 24-hour timeout |
+| Risk Levels | LOW, MEDIUM |
+| Auto-Pause | No |
+
+**Features**:
+- All transactions require manual approval via web dashboard
+- Event-driven approval (no polling)
+- 24-hour approval timeout
+- Interacts with LOW and MEDIUM risk contracts
+
+### Tier 3: COLD Wallet (Hardware)
+**Purpose**: Large holdings and high-value operations
+**File**: `src/wallet/cold_wallet_stub.py`
+
+| Setting | Value |
+|---------|-------|
+| Max Transaction | Unlimited |
+| Daily Limit | Unlimited |
+| Max Balance | Unlimited |
+| Approval | 168-hour (7 days) |
+| Risk Levels | LOW, MEDIUM, HIGH |
+| Hardware | Ledger required |
+
+**Features**:
+- Hardware wallet signature required
+- Extended approval period for review
+- Can interact with higher-risk contracts
+- Used for treasury operations
+
+---
+
+## Transaction Security Validator
+
+**File**: `src/security/transaction_validator.py`
+
+### Threat Detection
+
+The validator scans all transactions for:
+
+1. **EIP-7702 Delegation Attacks**
+   - Detects `0xef0100` authorization prefix
+   - Blocks delegation to unknown contracts
+   - Severity: CRITICAL (blocks transaction)
+
+2. **Permit2 Hidden Approvals**
+   - Warns on direct Permit2 interactions
+   - Detects hidden Permit2 address in calldata
+   - Monitors function selectors (permit, permitTransferFrom)
+   - Severity: WARNING to CRITICAL
+
+3. **Dangerous Function Calls**
+   - selfdestruct
+   - delegatecall
+   - setCode (EIP-7702)
+   - upgradeTo / upgradeToAndCall
+   - Severity: CRITICAL
+
+4. **Excessive Token Approvals**
+   - Detects `type(uint256).max` approvals
+   - Flags approvals > 10^30 tokens
+   - Severity: WARNING
+
+5. **Unknown Contracts**
+   - Strict mode blocks transactions to non-whitelisted addresses
+   - Logs unknown contract interactions
+   - Severity: CRITICAL in strict mode
+
+### Validation Flow
+
+```
+Transaction Request
+       ↓
+┌──────────────────────┐
+│  Whitelist Check     │ → BLOCKED if unknown
+└──────────────────────┘
+       ↓
+┌──────────────────────┐
+│  Tier Risk Check     │ → BLOCKED if risk too high
+└──────────────────────┘
+       ↓
+┌──────────────────────┐
+│  EIP-7702 Detection  │ → BLOCKED if delegation attack
+└──────────────────────┘
+       ↓
+┌──────────────────────┐
+│  Permit2 Analysis    │ → WARNING or BLOCKED
+└──────────────────────┘
+       ↓
+┌──────────────────────┐
+│  Dangerous Functions │ → BLOCKED if dangerous
+└──────────────────────┘
+       ↓
+┌──────────────────────┐
+│  Approval Limits     │ → WARNING if excessive
+└──────────────────────┘
+       ↓
+    APPROVED
+```
+
+---
+
+## Contract Whitelist
+
+**File**: `src/security/contract_whitelist.py`
+
+### Whitelisted Protocols (Base Network)
+
+| Protocol | Contract Type | Risk Level |
+|----------|---------------|------------|
+| USDC | Token | LOW |
+| WETH | Wrapper | LOW |
+| DAI | Token | LOW |
+| USDbC | Token | LOW |
+| Aave V3 Pool | Lending Pool | LOW |
+| Aave Data Provider | Oracle | LOW |
+| Moonwell Comptroller | Lending Pool | LOW |
+| Moonwell mUSDC/mWETH | Lending Pool | LOW |
+| Morpho Blue | Lending Pool | MEDIUM |
+| Aerodrome Router | DEX Router | LOW |
+| Uniswap V3 Router | DEX Router | LOW |
+| Permit2 | Approval | MEDIUM |
+
+### Risk Levels
+
+- **LOW**: Well-audited, high TVL, long track record
+- **MEDIUM**: Audited but newer or more complex
+- **HIGH**: New or experimental protocols
+- **CRITICAL**: Requires extra scrutiny
+
+### Adding New Contracts
+
+```python
+from src.security.contract_whitelist import get_contract_whitelist
+
+whitelist = get_contract_whitelist("base-mainnet")
+
+# Check if contract is allowed
+allowed, reason, info = whitelist.validate_transaction_target(
+    address="0x...",
+    strict_mode=True
+)
+
+if not allowed:
+    raise SecurityError(reason)
+```
+
+---
 
 ## Key Custody
 
@@ -97,22 +283,31 @@ Fund that address, set `CDP_EXPECTED_ADDRESS` to it, then set
 - All URLs validated (HTTPS required)
 
 ### Layer 3: Spending Limits
-- Per-transaction maximum
-- Daily spending limit
+- Per-transaction maximum (tier-specific)
+- Daily spending limit (tier-specific)
 - Weekly spending limit
 - Monthly spending limit
+- Auto-pause on breach (HOT wallet)
 
-### Layer 4: Approval Workflows
-- Threshold-based approval requirement
-- Manual confirmation for large amounts
-- Timeout on approval requests
-- Audit trail of all approvals
+### Layer 4: Transaction Validation
+- Contract whitelist enforcement
+- EIP-7702 delegation detection
+- Permit2 hidden approval detection
+- Dangerous function blocking
+- Excessive approval warnings
 
-### Layer 5: Audit Logging
+### Layer 5: Approval Workflows
+- Tier-based approval requirements
+- Event-driven approval (no polling)
+- Configurable timeout per tier
+- Web dashboard for manual review
+
+### Layer 6: Audit Logging
 - Immutable audit log
 - All transactions logged
-- All decisions logged
 - All security events logged
+- Threat detection logged
+- Approval decisions logged
 
 ## Threat Model
 
