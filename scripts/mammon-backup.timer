@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the MAMMON SQLite DB backup daily at 03:00
+Documentation=https://github.com/kpjmd/Mammon
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+# Catch up on a missed run (droplet asleep/rebooted at 03:00).
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,14 @@
+[Unit]
+Description=Run the MAMMON heartbeat dead-man check every 15 minutes
+Documentation=https://github.com/kpjmd/Mammon
+
+[Timer]
+# First check 5 min after boot, then every 15 min. A stale heartbeat older than
+# HEARTBEAT_MAX_AGE_SECONDS (default 10800s / 3h) triggers a CRITICAL webhook
+# alert, so 15-min granularity detects a dead loop well within that window.
+OnBootSec=5min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
