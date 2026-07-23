@@ -7,11 +7,18 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/root/mammon
+# Must match the rsync deploy target (vps_deploy.sh DEPLOY_DIR=/opt/mammon) so
+# pydantic-settings finds .env and the app resolves data/ (DB, heartbeat).
+WorkingDirectory=/opt/mammon
 Environment="PYTHONUNBUFFERED=1"
 Environment="PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin"
-ExecStart=/root/.local/bin/poetry run python -u scripts/run_autonomous_optimizer.py --duration 48 --interval 2
-Restart=on-failure
+# --duration 744 = 31 days (margin over the 30-day validation). Restart=always
+# is the real survivability guarantee: it restarts on BOTH a crash (non-zero)
+# and a clean exit at end_time, and after a droplet reboot. Restart is safe —
+# the circuit breaker persists to disk (data/circuit_breaker_state.json) and the
+# loop reconciles positions from on-chain state at each cycle start.
+ExecStart=/root/.local/bin/poetry run python -u scripts/run_autonomous_optimizer.py --duration 744 --interval 2
+Restart=always
 RestartSec=30
 StandardOutput=journal
 StandardError=journal
