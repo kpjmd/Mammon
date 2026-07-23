@@ -10,7 +10,7 @@ User=root
 # WorkingDirectory so the stdlib checker reads .env (ALERT_WEBHOOK,
 # HEARTBEAT_FILE, HEARTBEAT_MAX_AGE_SECONDS) and data/heartbeat.json relative
 # to the deploy dir. No poetry/venv needed — heartbeat_check.py is stdlib-only.
-WorkingDirectory=/opt/mammon
+WorkingDirectory=/root/mammon
 ExecStart=/usr/bin/python3 scripts/heartbeat_check.py
 # Exit 1 means the heartbeat is stale (alert already POSTed); do not treat the
 # oneshot as failed so the timer keeps firing.
