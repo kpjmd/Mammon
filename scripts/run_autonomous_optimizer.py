@@ -112,14 +112,15 @@ class AutonomousRunner:
         self.opportunities_skipped = 0
         self.errors: list = []
 
-    async def initialize(self) -> None:
-        """Initialize all components for autonomous operation."""
-        logger.info("🚀 START: Autonomous optimizer initialization starting")
-        print_header("MAMMON - Autonomous Optimizer Initialization")
+    def _build_config(self) -> Dict[str, Any]:
+        """Build the config dict shared by every component.
 
-        # Build config
-        logger.info("⚙️  STEP 1: Building configuration")
-        config = {
+        Extracted from ``initialize()`` so the wiring can be unit-tested without
+        constructing the wallet/network stack. In particular the per-day
+        rebalance/gas rails MUST appear here (see the note below), so a
+        regression test asserts on this dict directly.
+        """
+        return {
             "network": self.settings.network,
             # Custody selection (WS7). Without these keys WalletManager falls
             # back to config.get("use_local_wallet", True) and the CDP MPC path
@@ -137,6 +138,13 @@ class AutonomousRunner:
             "chainlink_enabled": True,
             "max_transaction_value_usd": self.settings.max_transaction_value_usd,
             "daily_spending_limit_usd": self.settings.daily_spending_limit_usd,
+            # Per-day churn/gas rails. These MUST reach the scheduler:
+            # ScheduledOptimizer._check_daily_limits() is the authoritative
+            # per-day gate (rolling 24h reset, skips rather than terminating).
+            # Without these keys it silently falls back to 5/day + $50/day gas,
+            # making the operator's --max-rebalances / --max-gas dead.
+            "max_rebalances_per_day": self.max_rebalances_per_day,
+            "max_gas_per_day_usd": self.max_gas_per_day_usd,
             # Live wallet safety latch + balance cap (WS2 hardening)
             "wallet_auto_pause": self.settings.wallet_auto_pause,
             "max_wallet_balance_usd": self.settings.max_wallet_balance_usd,
@@ -162,6 +170,15 @@ class AutonomousRunner:
             # live test without touching MAX_TRANSACTION_VALUE_USD).
             "max_deploy_usd": self.max_deploy_usd,
         }
+
+    async def initialize(self) -> None:
+        """Initialize all components for autonomous operation."""
+        logger.info("🚀 START: Autonomous optimizer initialization starting")
+        print_header("MAMMON - Autonomous Optimizer Initialization")
+
+        # Build config
+        logger.info("⚙️  STEP 1: Building configuration")
+        config = self._build_config()
         logger.info("✅ STEP 1: Configuration built successfully")
 
         print(f"Network: {config['network']}")
@@ -343,16 +360,14 @@ class AutonomousRunner:
                 if not self.running:
                     break
 
-                # Check limits
-                if self.total_rebalances >= self.max_rebalances_per_day:
-                    logger.warning(f"Reached max rebalances ({self.max_rebalances_per_day})")
-                    print(f"\n⚠️  Reached max rebalances limit ({self.max_rebalances_per_day})")
-                    break
-
-                if self.total_gas_spent_usd >= self.max_gas_per_day_usd:
-                    logger.warning(f"Reached max gas spend (${self.max_gas_per_day_usd})")
-                    print(f"\n⚠️  Reached max gas spend (${self.max_gas_per_day_usd})")
-                    break
+                # NOTE: the per-day rebalance/gas rails are NOT enforced here.
+                # self.total_rebalances / self.total_gas_spent_usd are cumulative
+                # lifetime-of-run totals (see _generate_summary); breaking on them
+                # here terminated a multi-day run permanently once the lifetime
+                # total crossed the cap. The authoritative per-day gate lives in
+                # ScheduledOptimizer._check_daily_limits(), which resets on a
+                # rolling 24h window and skips a rebalance rather than ending the
+                # run. Keep the runner as a pure scan-and-sleep loop.
 
                 # Sleep until next scan
                 next_scan = datetime.now(UTC) + timedelta(hours=self.scan_interval_hours)
