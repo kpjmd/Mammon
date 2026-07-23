@@ -9,7 +9,7 @@ Type=oneshot
 User=root
 # Stdlib-only online-backup (safe against the live writer) + gzip + prune.
 # WorkingDirectory so it reads .env (ALERT_WEBHOOK) and resolves data/ paths.
-WorkingDirectory=/opt/mammon
+WorkingDirectory=/root/mammon
 ExecStart=/usr/bin/python3 scripts/backup_db.py --db data/mammon.db --backup-dir data/backups --keep 14
 SyslogIdentifier=mammon-backup
 # NOTE: off-droplet replication (e.g. `rclone copy data/backups remote:...`) is
