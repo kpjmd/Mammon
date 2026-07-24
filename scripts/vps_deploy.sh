@@ -177,7 +177,9 @@ MIN_PROFIT_USD=0.50
 # MAX_GAS_PER_DAY_USD is a runaway backstop (trips on a gas spike / loop bug),
 # not a normal limiter; MAX_REBALANCES_PER_DAY is the churn rail. These now feed
 # the scheduler's authoritative per-day gate.
-MAX_REBALANCES_PER_DAY=24
+# NOTE: Settings caps max_rebalances_per_day at le=20 — a higher value fails
+# validation at startup. 20 is the ceiling.
+MAX_REBALANCES_PER_DAY=20
 MAX_GAS_PER_DAY_USD=2.0
 
 # Spending Limits
