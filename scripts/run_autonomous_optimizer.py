@@ -45,7 +45,7 @@ from src.strategies.profitability_calculator import ProfitabilityCalculator
 from src.strategies.simple_yield import SimpleYieldStrategy
 from src.security.audit import AuditLogger
 from src.utils.config import get_settings
-from src.utils.logger import get_logger
+from src.utils.logger import get_logger, setup_logging
 from src.utils.heartbeat import write_heartbeat
 from src.utils.alerts import get_alert_manager
 
@@ -707,6 +707,14 @@ def print_header(title: str):
 
 async def main():
     """Main entry point."""
+    # Attach a stdout handler to the "mammon" logger tree. Without this,
+    # get_logger() returns a handler-less logger and Python's lastResort
+    # handler applies: WARNING+ goes to stderr unformatted and every
+    # logger.info/debug is silently DROPPED. Under systemd that meant the
+    # entire INFO-level operational trail was missing from the journal while
+    # bare print() output still appeared. Do this first so startup logs count.
+    setup_logging(log_level=get_settings().log_level, json_format=False)
+
     parser = argparse.ArgumentParser(
         description="Run MAMMON autonomous optimizer"
     )
