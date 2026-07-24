@@ -704,14 +704,16 @@ async def main():
     parser.add_argument(
         "--max-rebalances",
         type=int,
-        default=6,
-        help="Maximum rebalances per day (default: 6)"
+        default=None,
+        help="Maximum rebalances per day "
+             "(default: MAX_REBALANCES_PER_DAY from .env)"
     )
     parser.add_argument(
         "--max-gas",
         type=float,
-        default=10.0,
-        help="Maximum gas spend per day in USD (default: 10)"
+        default=None,
+        help="Maximum gas spend per day in USD "
+             "(default: MAX_GAS_PER_DAY_USD from .env)"
     )
     parser.add_argument(
         "--dry-run",
@@ -733,12 +735,33 @@ async def main():
     # Handle --dry-run flag: only pass True if explicitly set, otherwise None (read from .env)
     dry_run_arg = True if args.dry_run else None
 
+    # Per-day rails: .env is authoritative, CLI is an explicit override. These
+    # were previously hardcoded CLI defaults (6/day, $10/day gas) that silently
+    # ignored MAX_REBALANCES_PER_DAY / MAX_GAS_PER_DAY_USD, so a service unit
+    # that passes neither flag ran with limits the operator never chose.
+    _settings = get_settings()
+    max_rebalances = (
+        args.max_rebalances
+        if args.max_rebalances is not None
+        else _settings.max_rebalances_per_day
+    )
+    max_gas = (
+        Decimal(str(args.max_gas))
+        if args.max_gas is not None
+        else _settings.max_gas_per_day_usd
+    )
+    logger.info(
+        f"Per-day rails: max_rebalances={max_rebalances}, max_gas_usd={max_gas} "
+        f"(source: {'CLI' if args.max_rebalances is not None else '.env'}/"
+        f"{'CLI' if args.max_gas is not None else '.env'})"
+    )
+
     # Create runner
     runner = AutonomousRunner(
         duration_hours=args.duration,
         scan_interval_hours=args.interval,
-        max_rebalances_per_day=args.max_rebalances,
-        max_gas_per_day_usd=Decimal(str(args.max_gas)),
+        max_rebalances_per_day=max_rebalances,
+        max_gas_per_day_usd=max_gas,
         dry_run=dry_run_arg,
         max_deploy_usd=(
             Decimal(str(args.max_deploy_usd))
