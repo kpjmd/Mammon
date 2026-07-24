@@ -57,10 +57,19 @@ SUPPORTED_PROTOCOLS = ["Aave V3", "Moonwell"]
 def _build_scanner_and_oracle(settings):
     """Build a read-only YieldScannerAgent + shared oracle (no wallet)."""
     if getattr(settings, "chainlink_enabled", True):
+        # Mirror the live loop's oracle settings. Omitting these left the
+        # verifier on create_price_oracle's 3600s default, so a feed with a
+        # longer heartbeat (Chainlink USDC/USD on Base updates ~daily) was
+        # judged stale on every read and silently fell back to mock prices --
+        # meaning the verifier compared DB values against mock, not the chain.
         oracle = create_price_oracle(
             "chainlink",
             network=settings.network,
             price_network=getattr(settings, "chainlink_price_network", "base-mainnet"),
+            cache_ttl_seconds=getattr(settings, "chainlink_cache_ttl_seconds", 300),
+            max_staleness_seconds=getattr(
+                settings, "chainlink_max_staleness_seconds", 3600
+            ),
             fallback_to_mock=getattr(settings, "chainlink_fallback_to_mock", True),
         )
     else:
