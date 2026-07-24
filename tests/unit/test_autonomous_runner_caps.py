@@ -69,7 +69,7 @@ def test_lifetime_total_does_not_break_run(monkeypatch):
     runner = AutonomousRunner(
         duration_hours=100.0,  # far in the future so time never ends the loop
         scan_interval_hours=0.0001,  # ~0 sleep iterations
-        max_rebalances_per_day=24,
+        max_rebalances_per_day=20,
         max_gas_per_day_usd=Decimal("2"),
         dry_run=True,
     )
@@ -111,12 +111,12 @@ def test_operator_caps_propagate_to_config():
     runner = AutonomousRunner(
         duration_hours=1.0,
         scan_interval_hours=2.0,
-        max_rebalances_per_day=24,
+        max_rebalances_per_day=20,
         max_gas_per_day_usd=Decimal("2"),
         dry_run=True,
     )
 
     config = runner._build_config()
 
-    assert config["max_rebalances_per_day"] == 24
+    assert config["max_rebalances_per_day"] == 20
     assert config["max_gas_per_day_usd"] == Decimal("2")
