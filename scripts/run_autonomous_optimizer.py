@@ -304,6 +304,63 @@ class AutonomousRunner:
 
         print("\n✅ Initialization complete!")
 
+    async def _portfolio_snapshot(self) -> Dict[str, Any]:
+        """Value the whole portfolio: idle wallet balances + deployed positions.
+
+        Idle stablecoin balances used to be omitted, counting only ETH + DeFi
+        positions. A run that began with all capital sitting idle therefore
+        reported a portfolio far below reality, and P&L became nonsense the
+        moment that capital deployed (an idle->deployed move looked like pure
+        profit, e.g. +317%). Deploying capital is a transfer between buckets,
+        not a gain, so both buckets must be counted.
+
+        Positions are scoped to the CURRENT wallet so rows left behind by a
+        previous wallet (e.g. after a custody migration) cannot inflate the
+        totals.
+        """
+        eth_balance = await self.wallet.get_balance("ETH")
+        if not isinstance(eth_balance, Decimal):
+            eth_balance = Decimal(str(eth_balance))
+        eth_value_usd = eth_balance * await self.oracle.get_price("ETH")
+
+        # Idle (undeployed) stablecoin sitting in the wallet.
+        usdc_balance = await self.wallet.get_balance("USDC")
+        if not isinstance(usdc_balance, Decimal):
+            usdc_balance = Decimal(str(usdc_balance))
+        usdc_value_usd = usdc_balance * await self.oracle.get_price("USDC")
+
+        positions = await self.position_tracker.get_current_positions(
+            wallet_address=self.wallet.address
+        )
+        positions_value_usd = sum(
+            (p.value_usd for p in positions), Decimal("0")
+        )
+
+        return {
+            "eth_balance": eth_balance,
+            "eth_value_usd": eth_value_usd,
+            "usdc_balance": usdc_balance,
+            "usdc_value_usd": usdc_value_usd,
+            "positions": positions,
+            "positions_value_usd": positions_value_usd,
+            "total_usd": eth_value_usd + usdc_value_usd + positions_value_usd,
+        }
+
+    @staticmethod
+    def _print_portfolio(label: str, snap: Dict[str, Any]) -> None:
+        """Print a portfolio breakdown (idle + deployed)."""
+        print(f"{label}: ${snap['total_usd']:.2f}")
+        print(
+            f"  ETH: {snap['eth_balance']:.6f} ETH (${snap['eth_value_usd']:.2f})"
+        )
+        print(
+            f"  Idle USDC: {snap['usdc_balance']:.2f} (${snap['usdc_value_usd']:.2f})"
+        )
+        if snap["positions_value_usd"] > 0:
+            print(f"  DeFi Positions: ${snap['positions_value_usd']:.2f}")
+            for pos in snap["positions"]:
+                print(f"    {pos.protocol} {pos.pool_id}: ${pos.value_usd:.2f}")
+
     async def run(self) -> Dict[str, Any]:
         """Run the autonomous optimizer for the configured duration.
 
@@ -320,30 +377,11 @@ class AutonomousRunner:
         print(f"End Time: {self.end_time.isoformat()}")
         print(f"Total Scans Expected: {int(self.duration_hours / self.scan_interval_hours)}")
 
-        # Initial wallet balance - simplified for autonomy test
+        # Initial portfolio: idle balances + deployed positions.
         try:
-            eth_balance = await self.wallet.get_balance()
-            # get_balance returns Decimal for ETH
-            if isinstance(eth_balance, Decimal):
-                initial_balance = eth_balance
-            else:
-                initial_balance = Decimal(str(eth_balance))
-            eth_price = await self.oracle.get_price("ETH")
-            eth_value_usd = initial_balance * eth_price
-
-            # Get DeFi positions from database
-            positions = await self.position_tracker.get_current_positions()
-            positions_value_usd = sum(p.value_usd for p in positions)
-
-            # Total portfolio = ETH + DeFi positions
-            initial_value_usd = eth_value_usd + positions_value_usd
-
-            print(f"Initial Portfolio: ${initial_value_usd:.2f}")
-            print(f"  ETH: {initial_balance:.6f} ETH (${eth_value_usd:.2f})")
-            if positions_value_usd > 0:
-                print(f"  DeFi Positions: ${positions_value_usd:.2f}")
-                for pos in positions:
-                    print(f"    {pos.protocol} {pos.pool_id}: ${pos.value_usd:.2f}")
+            snap = await self._portfolio_snapshot()
+            initial_value_usd = snap["total_usd"]
+            self._print_portfolio("Initial Portfolio", snap)
         except Exception as e:
             initial_value_usd = Decimal("0")
             print(f"Could not fetch balance: {e}")
@@ -574,23 +612,12 @@ class AutonomousRunner:
         end_time = datetime.now(UTC)
         duration = end_time - self.start_time
 
-        # Get final balance - ETH + DeFi positions
+        # Final portfolio: idle balances + deployed positions (same basis as
+        # the initial snapshot, so P&L compares like with like).
+        final_snap = None
         try:
-            # Get final ETH balance
-            final_eth_balance = await self.wallet.get_balance()
-            if isinstance(final_eth_balance, Decimal):
-                final_eth = final_eth_balance
-            else:
-                final_eth = Decimal(str(final_eth_balance))
-            eth_price = await self.oracle.get_price("ETH")
-            final_eth_value = final_eth * eth_price
-
-            # Get final position values (may have changed due to rebalances)
-            final_positions = await self.position_tracker.get_current_positions()
-            final_positions_value = sum(p.value_usd for p in final_positions)
-
-            # Total final portfolio value
-            final_balance = final_eth_value + final_positions_value
+            final_snap = await self._portfolio_snapshot()
+            final_balance = final_snap["total_usd"]
         except Exception as e:
             logger.warning(f"Could not fetch final balance: {e}")
             final_balance = initial_balance  # Fallback to initial
@@ -638,20 +665,14 @@ class AutonomousRunner:
         print(f"  Initial Portfolio: ${initial_balance:.2f}")
         print(f"  Final Portfolio: ${final_balance:.2f}")
 
-        # Show breakdown if we have positions
-        try:
-            final_eth_detail = await self.wallet.get_balance()
-            final_eth_val = final_eth_detail * await self.oracle.get_price("ETH") if isinstance(final_eth_detail, Decimal) else Decimal(str(final_eth_detail)) * await self.oracle.get_price("ETH")
-            final_pos = await self.position_tracker.get_current_positions()
-            final_pos_val = sum(p.value_usd for p in final_pos)
-
-            print(f"    ETH: ${final_eth_val:.2f}")
-            if final_pos_val > 0:
-                print(f"    DeFi Positions: ${final_pos_val:.2f}")
-                for pos in final_pos:
+        # Show the final breakdown (reuses the snapshot above - no re-fetch).
+        if final_snap is not None:
+            print(f"    ETH: ${final_snap['eth_value_usd']:.2f}")
+            print(f"    Idle USDC: ${final_snap['usdc_value_usd']:.2f}")
+            if final_snap["positions_value_usd"] > 0:
+                print(f"    DeFi Positions: ${final_snap['positions_value_usd']:.2f}")
+                for pos in final_snap["positions"]:
                     print(f"      {pos.protocol} {pos.pool_id}: ${pos.value_usd:.2f}")
-        except Exception:
-            pass  # Skip breakdown if can't fetch
 
         print(f"  P&L: ${pnl:.2f} ({pnl_percent:.2f}%)")
         print(f"  Gas Spent: ${self.total_gas_spent_usd:.4f}")
