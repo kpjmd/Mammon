@@ -363,3 +363,31 @@ class TestCycleIntegration:
         positions = await opt._get_current_positions()
 
         assert positions == {"Moonwell": Decimal("100")}
+
+
+class TestUnsupportedBalanceReads:
+    async def test_not_implemented_is_skipped_once_without_warning(
+        self, tmp_path, caplog
+    ):
+        """Morpho-style NotImplementedError: no retries, no per-pool WARNING."""
+        import logging
+
+        morpho = _proto("Morpho", NotImplementedError("not yet implemented"))
+        opt, tracker = _make_optimizer(
+            tmp_path,
+            opportunities=[
+                _opp("Morpho", "morpho-usdc-market-1"),
+                _opp("Moonwell", "moonwell-usdc"),
+            ],
+            protocols=[morpho, _proto("Moonwell", "100")],
+        )
+
+        with caplog.at_level(logging.INFO):
+            await opt.reconcile_positions(
+                expect_nonzero=["Morpho"], retries=2, retry_delay_s=0
+            )
+
+        assert morpho.get_user_balance.await_count == 1
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert "balance reads not implemented for ['Morpho']" in caplog.text
+        assert [r.protocol for r in await _active(tracker)] == ["Moonwell"]

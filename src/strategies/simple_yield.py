@@ -12,7 +12,11 @@ Strategy Logic:
 
 from typing import Any, Dict, List, Optional
 from decimal import Decimal
-from src.strategies.base_strategy import BaseStrategy, RebalanceRecommendation
+from src.strategies.base_strategy import (
+    BaseStrategy,
+    RebalanceRecommendation,
+    RejectedAlternative,
+)
 from src.strategies.profitability_calculator import ProfitabilityCalculator
 from src.utils.logger import get_logger
 
@@ -100,6 +104,7 @@ class SimpleYieldStrategy(BaseStrategy):
         logger.info(f"🔍 DEBUG: available_yields = {available_yields}")
 
         recommendations = []
+        self.last_rejections = []
 
         logger.info(
             f"Analyzing {len(current_positions)} positions against "
@@ -111,7 +116,7 @@ class SimpleYieldStrategy(BaseStrategy):
             logger.info(f"🔍 DEBUG: Analyzing position: {current_protocol} = ${position_amount}")
             # Skip positions below minimum
             if position_amount < self.min_rebalance_amount:
-                logger.debug(
+                logger.info(
                     f"Skipping {current_protocol}: position ${position_amount:.2f} "
                     f"below minimum ${self.min_rebalance_amount}"
                 )
@@ -148,10 +153,15 @@ class SimpleYieldStrategy(BaseStrategy):
             # Check APY improvement threshold
             apy_improvement = best_apy - current_apy
             if apy_improvement < self.min_apy_improvement:
-                logger.debug(
-                    f"Skipping {current_protocol} → {best_protocol}: "
-                    f"improvement {apy_improvement}% below threshold "
-                    f"{self.min_apy_improvement}%"
+                reason = (
+                    f"Strategy: APY improvement {apy_improvement:.4f}% below "
+                    f"threshold {self.min_apy_improvement}%"
+                )
+                logger.info(f"Skipping {current_protocol} → {best_protocol}: {reason}")
+                self.last_rejections.append(
+                    RejectedAlternative(
+                        current_protocol, best_protocol, current_apy, best_apy, reason
+                    )
                 )
                 continue
 
@@ -187,9 +197,18 @@ class SimpleYieldStrategy(BaseStrategy):
                     f"(${position_amount:,.0f} @ {best_apy}% APY)"
                 )
             else:
+                reasons = "; ".join(profitability.rejection_reasons) or "unprofitable"
                 logger.info(
-                    f"❌ UNPROFITABLE: {current_protocol} → {best_protocol} - "
-                    f"{'; '.join(profitability.rejection_reasons)}"
+                    f"❌ UNPROFITABLE: {current_protocol} → {best_protocol} - {reasons}"
+                )
+                self.last_rejections.append(
+                    RejectedAlternative(
+                        current_protocol,
+                        best_protocol,
+                        current_apy,
+                        best_apy,
+                        f"Strategy: unprofitable — {reasons}",
+                    )
                 )
 
         logger.info(f"Generated {len(recommendations)} recommendations")

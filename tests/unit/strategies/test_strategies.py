@@ -665,3 +665,57 @@ async def test_risk_adjusted_multiple_positions(
     # But RiskAdjusted only recommends first alternative per position
     assert len(recommendations) <= 2
     assert all(rec.to_protocol in ["Aave V3", "Morpho"] for rec in recommendations)
+
+
+# =============================================================================
+# SimpleYieldStrategy rejection surfacing (feeds the decisions ledger)
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_simple_strategy_surfaces_below_threshold_rejection(simple_strategy):
+    """A better-but-sub-threshold alternative is surfaced, not silently dropped."""
+    await simple_strategy.analyze_opportunities(
+        {"Aave V3": Decimal("1000")},
+        {"Aave V3": Decimal("5.0"), "Moonwell": Decimal("5.2")},
+    )
+
+    assert len(simple_strategy.last_rejections) == 1
+    rejection = simple_strategy.last_rejections[0]
+    assert (rejection.from_protocol, rejection.to_protocol) == ("Aave V3", "Moonwell")
+    assert rejection.apy_improvement == Decimal("0.2")
+    assert "below threshold 0.5%" in rejection.reason
+
+
+@pytest.mark.asyncio
+async def test_simple_strategy_surfaces_unprofitable_rejection(
+    simple_strategy, mock_profitability_calc
+):
+    mock_profitability_calc.calculate_profitability.return_value = MagicMock(
+        is_profitable=False, rejection_reasons=["Net gain too low"]
+    )
+
+    await simple_strategy.analyze_opportunities(
+        {"Aave V3": Decimal("1000")},
+        {"Aave V3": Decimal("5.0"), "Morpho": Decimal("6.0")},
+    )
+
+    assert [r.reason for r in simple_strategy.last_rejections] == [
+        "Strategy: unprofitable — Net gain too low"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_simple_strategy_rejections_reset_each_call(simple_strategy):
+    """An already-optimal call must not carry over the previous call's rejections."""
+    await simple_strategy.analyze_opportunities(
+        {"Aave V3": Decimal("1000")},
+        {"Aave V3": Decimal("5.0"), "Moonwell": Decimal("5.2")},
+    )
+    assert simple_strategy.last_rejections
+
+    await simple_strategy.analyze_opportunities(
+        {"Moonwell": Decimal("1000")},
+        {"Moonwell": Decimal("9.0"), "Aave V3": Decimal("4.0")},
+    )
+    assert simple_strategy.last_rejections == []

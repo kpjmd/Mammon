@@ -4,6 +4,7 @@ This module defines the interface that all yield strategies must implement.
 """
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, Dict, List
 from decimal import Decimal
 
@@ -54,6 +55,25 @@ class RebalanceRecommendation:
         self.current_apy = current_apy
 
 
+@dataclass(frozen=True)
+class RejectedAlternative:
+    """A better-yielding alternative the strategy saw but declined to recommend.
+
+    Surfaced so the caller can persist it as a rejected decision: without it, a
+    hold driven by the strategy's own thresholds leaves no trace in the ledger.
+    """
+
+    from_protocol: str
+    to_protocol: str
+    current_apy: Decimal
+    target_apy: Decimal
+    reason: str
+
+    @property
+    def apy_improvement(self) -> Decimal:
+        return self.target_apy - self.current_apy
+
+
 class BaseStrategy(ABC):
     """Abstract base class for yield optimization strategies.
 
@@ -74,6 +94,8 @@ class BaseStrategy(ABC):
         """
         self.name = name
         self.config = config
+        # Filled by analyze_opportunities(); consumed (and cleared) by the caller.
+        self.last_rejections: List[RejectedAlternative] = []
 
     @abstractmethod
     async def analyze_opportunities(
