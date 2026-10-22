@@ -318,3 +318,25 @@ async def test_pools_metadata_has_risk_tier(mock_config):
     for pool in pools:
         assert "risk_tier" in pool.metadata
         assert pool.metadata["risk_tier"] in ["low", "medium", "high"]
+
+
+@pytest.mark.asyncio
+async def test_get_pools_api_failure_fails_closed(monkeypatch):
+    """A real-API failure must propagate, never substitute mock APYs.
+
+    Regression: the 30-day live run fell back to a flat mock 7.8% Morpho APY on
+    every cycle because the GraphQL API returned 400.
+    """
+    morpho = MorphoProtocol({"network": "base-mainnet", "use_mock_data": False})
+
+    async def _api_down():
+        raise RuntimeError("400 Client Error: Bad Request")
+
+    def _no_mock():
+        raise AssertionError("mock pools must not be used when use_mock_data=False")
+
+    monkeypatch.setattr(morpho, "_get_real_pools_from_api", _api_down)
+    monkeypatch.setattr(morpho, "_get_mock_pools", _no_mock)
+
+    with pytest.raises(RuntimeError, match="400"):
+        await morpho.get_pools()

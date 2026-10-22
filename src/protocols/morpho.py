@@ -194,10 +194,15 @@ class MorphoProtocol(BaseProtocol):
         """Fetch all available lending markets from Morpho on Base mainnet.
 
         Phase 3 Sprint 2: Queries REAL data from Morpho Blue GraphQL API.
-        Falls back to mock data if API fails or if use_mock_data=True.
+        Returns mock data ONLY when use_mock_data=True.
 
         Returns:
             List of Morpho lending markets
+
+        Raises:
+            Exception: If the real API fails. Fail-closed: mock APYs must never
+                reach a live decision, so the scanner drops Morpho for this
+                cycle (and counts the failure toward its circuit breaker).
         """
         # Log pool query
         await self.audit_logger.log_event(
@@ -220,8 +225,8 @@ class MorphoProtocol(BaseProtocol):
         try:
             return await self._get_real_pools_from_api()
         except Exception as e:
-            logger.error(f"Failed to fetch real Morpho data, falling back to mock: {e}")
-            return self._get_mock_pools()
+            logger.error(f"Failed to fetch real Morpho data (no mock fallback): {e}")
+            raise
 
     async def _get_real_pools_from_api(self) -> List[ProtocolPool]:
         """Fetch real Morpho Blue markets from GraphQL API.

@@ -275,3 +275,17 @@ async def test_contract_addresses_base_sepolia():
     assert "factory" in contracts
     # Sepolia uses mock addresses for Phase 1B
     assert contracts["router"] is not None
+
+
+@pytest.mark.asyncio
+async def test_get_pools_mainnet_failure_fails_closed(monkeypatch):
+    """A mainnet fetch failure must propagate, never fall through to mock pools."""
+    aerodrome = AerodromeProtocol({"network": "base-mainnet", "dry_run_mode": False})
+
+    async def _rpc_down():
+        raise RuntimeError("rpc unavailable")
+
+    monkeypatch.setattr(aerodrome, "_get_real_pools_from_mainnet", _rpc_down)
+
+    with pytest.raises(RuntimeError, match="rpc unavailable"):
+        await aerodrome.get_pools()
