@@ -339,18 +339,26 @@ class ScheduledOptimizer:
             await self._alert_stranded_intents()
             await self._check_balance_cap()
 
+            # One protocol sweep per cycle, shared by reconcile and the
+            # optimizer (each used to scan on its own, doubling every
+            # protocol API/RPC call and error line).
+            opportunities = await self._scan_for_cycle()
+
             # 0. Reconcile the positions table with on-chain truth before the
             # read below, so decisions see funds moved outside the loop (e.g. a
             # manual protocol exit) and positions deployed in a prior cycle.
-            if self.reconcile_on_read:
-                await self.reconcile_positions()
+            # Skipped when the scan failed outright: no pool could be read, so
+            # there is nothing to reconcile (and nothing may be closed).
+            if self.reconcile_on_read and opportunities is not None:
+                await self.reconcile_positions(opportunities=opportunities)
 
             # 1. Get current positions
             current_positions = await self._get_current_positions()
 
-            # 2. Get rebalance recommendations
+            # 2. Get rebalance recommendations. On a failed shared scan
+            # (None) the optimizer falls back to its own scan + error audit.
             recommendations = await self.optimizer.find_rebalance_opportunities(
-                current_positions
+                current_positions, opportunities=opportunities
             )
             await self._record_strategy_rejections()
 
@@ -598,6 +606,20 @@ class ScheduledOptimizer:
         # No position tracker or error - return empty positions
         logger.warning("⚠️  No position tracker available or error occurred")
         return {}
+
+    async def _scan_for_cycle(self) -> Optional[List[YieldOpportunity]]:
+        """Run the cycle's single protocol scan; None if it raised.
+
+        Per-protocol failures are already absorbed by scan_all_protocols
+        (those pools are simply absent), so this only guards against the
+        whole sweep raising. Never fatal: callers treat None as "no shared
+        scan available".
+        """
+        try:
+            return await self.yield_scanner.scan_all_protocols()
+        except Exception as e:
+            logger.error(f"Cycle protocol scan failed: {e}", exc_info=True)
+            return None
 
     async def reconcile_positions(
         self,
