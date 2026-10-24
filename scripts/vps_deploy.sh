@@ -208,6 +208,10 @@ CHAINLINK_PRICE_NETWORK=base-mainnet
 ALERT_WEBHOOK=
 HEARTBEAT_FILE=data/heartbeat.json
 HEARTBEAT_MAX_AGE_SECONDS=10800
+# Off-droplet DB backup replication (mammon-backup.service ExecStartPost).
+# Must name an rclone CRYPT remote, e.g. mammon-crypt: — blank = the backup unit
+# fails and alerts daily. Setup: docs/backup_replication.md.
+BACKUP_REMOTE=
 
 # Circuit breaker (latching; persists to data/circuit_breaker_state.json).
 # Resume after a trip with: python scripts/resume_optimizer.py --confirm

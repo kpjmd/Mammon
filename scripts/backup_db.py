@@ -5,11 +5,9 @@ STDLIB-ONLY and app-independent so it can run from cron / a systemd timer on the
 droplet without importing the app. Uses SQLite's online backup API, which is
 safe against a live writer.
 
-    0 3 * * * cd /root/mammon && /usr/bin/python3 scripts/backup_db.py \
-        && rclone copy data/backups remote:mammon-backups
-
-Off-droplet copy (rclone/scp) is intentionally left to the cron line above so
-the destination stays configurable; losing the droplet must not lose the ledger.
+Driven daily by ``mammon-backup.timer``. Off-droplet replication is the
+unit's ``ExecStartPost=`` (``scripts/replicate_backups.py``, encrypted rclone
+remote from ``BACKUP_REMOTE``); losing the droplet must not lose the ledger.
 """
 
 import argparse
