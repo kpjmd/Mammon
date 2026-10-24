@@ -10,7 +10,7 @@ Phase 3 Sprint 3: Orchestrates the complete optimization flow:
 3. Generate recommendations with audit logging
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from decimal import Decimal
 from src.agents.yield_scanner import YieldScannerAgent, YieldOpportunity
 from src.strategies.base_strategy import BaseStrategy, RebalanceRecommendation
@@ -67,11 +67,12 @@ class OptimizerAgent:
     async def find_rebalance_opportunities(
         self,
         current_positions: Dict[str, Decimal],
+        opportunities: Optional[List[YieldOpportunity]] = None,
     ) -> List[RebalanceRecommendation]:
         """Find optimal rebalancing opportunities for current positions.
 
         This is the main optimization workflow that:
-        1. Scans all protocols for current yields
+        1. Scans all protocols for current yields (unless pre-fetched)
         2. Converts scanner output to strategy input format
         3. Calls strategy to analyze opportunities
         4. Audit logs all recommendations
@@ -80,6 +81,8 @@ class OptimizerAgent:
         Args:
             current_positions: Current positions as Dict[protocol, amount_usd]
                 Example: {"Aave V3": Decimal("1000"), "Morpho": Decimal("500")}
+            opportunities: Scan results already fetched this cycle (e.g. by
+                the scheduler, shared with position reconcile). None = scan.
 
         Returns:
             List of rebalance recommendations, sorted by confidence
@@ -103,7 +106,8 @@ class OptimizerAgent:
 
         # Step 1: Scan all protocols for current yields
         try:
-            opportunities = await self.scanner.scan_all_protocols()
+            if opportunities is None:
+                opportunities = await self.scanner.scan_all_protocols()
             logger.info(f"Found {len(opportunities)} yield opportunities across protocols")
         except Exception as e:
             logger.error(f"Failed to scan protocols: {e}")
