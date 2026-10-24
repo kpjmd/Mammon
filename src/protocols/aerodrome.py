@@ -157,12 +157,14 @@ class AerodromeProtocol(BaseProtocol):
         # If Base mainnet, fetch REAL data (dry_run only affects transactions, not data)
         # Note: dry_run_mode controls transaction execution in RebalanceExecutor,
         # not data fetching. We want real pool data even when testing.
+        # Fail-closed: a mainnet fetch failure propagates (the scanner drops
+        # Aerodrome for this cycle) — mock APYs must never reach a live decision.
         if self.network == "base-mainnet":
             try:
                 return await self._get_real_pools_from_mainnet()
             except Exception as e:
-                logger.error(f"Failed to fetch real pools, falling back to mock: {e}")
-                # Fall through to mock data
+                logger.error(f"Failed to fetch real Aerodrome pools (no mock fallback): {e}")
+                raise
 
         # Return mock pools for testing/other networks
         mock_pools = [

@@ -237,20 +237,23 @@ class TestGracefulDegradation:
     """Test graceful degradation when services are unavailable."""
 
     @pytest.mark.asyncio
-    async def test_fallback_to_mock_data(self):
-        """Verify system can fallback to mock data if RPC fails."""
+    async def test_mainnet_failure_does_not_fallback_to_mock(self):
+        """A mainnet RPC failure must raise (fail-closed), never return mock pools.
+
+        The scanner catches the error and drops the protocol for that cycle, so
+        mock APYs can never drive a live decision.
+        """
         protocol = AerodromeProtocol({
             "network": "base-mainnet",
             "dry_run_mode": False
         })
 
-        # If real query fails, should fallback to mock
-        try:
-            pools = await protocol.get_pools()
-            assert len(pools) > 0, "Should get either real or mock pools"
-        except Exception:
-            # If it raises, should be clear error
-            pytest.fail("Should fallback to mock data on RPC failure")
+        async def _rpc_down():
+            raise RuntimeError("rpc unavailable")
+
+        protocol._get_real_pools_from_mainnet = _rpc_down
+        with pytest.raises(RuntimeError, match="rpc unavailable"):
+            await protocol.get_pools()
 
     def test_dry_run_mode_always_works(self):
         """Verify dry-run mode works even if RPC is down."""
@@ -280,7 +283,7 @@ ERROR RECOVERY TEST RESULTS:
 ✅ PASS: Errors are logged properly
 ✅ PASS: Single pool error doesn't break batch query
 ✅ PASS: Network errors are isolated
-✅ PASS: Can fallback to mock data on RPC failure
+✅ PASS: Mainnet RPC failure fails closed (no mock fallback)
 ✅ PASS: Dry-run mode always works (no RPC dependency)
 
 ERROR HANDLING MECHANISMS:
