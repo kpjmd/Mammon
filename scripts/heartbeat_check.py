@@ -17,9 +17,10 @@ import argparse
 import json
 import os
 import sys
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+
+from alert_webhook import post_webhook
 
 DEFAULT_HEARTBEAT = "data/heartbeat.json"
 DEFAULT_MAX_AGE = 10800  # 3h (1.5x a 2h scan interval)
@@ -43,20 +44,17 @@ def _read_env(key: str) -> str:
     return ""
 
 
-def _post_alert(webhook: str, title: str, message: str) -> None:
+def _post_alert(webhook: str, title: str, message: str) -> bool:
+    """POST a CRITICAL alert. True if delivered or no webhook is configured."""
     if not webhook:
-        return
+        return True
     text = f"[CRITICAL] MAMMON: {title}\n{message}"
-    payload = json.dumps(
-        {"content": text, "text": text, "level": "critical", "title": title}
-    ).encode()
-    req = urllib.request.Request(
-        webhook, data=payload, headers={"Content-Type": "application/json"}
-    )
     try:
-        urllib.request.urlopen(req, timeout=5)
+        post_webhook(webhook, {"content": text, "text": text, "level": "critical", "title": title})
     except Exception as e:  # noqa: BLE001 - alerting is best-effort
         print(f"Alert POST failed: {e}", file=sys.stderr)
+        return False
+    return True
 
 
 def main() -> int:
@@ -76,8 +74,10 @@ def main() -> int:
 
     def _fail(reason: str) -> int:
         print(f"STALE: {reason}")
-        if not marker.exists():  # one-shot alert until recovery
-            _post_alert(webhook, "MAMMON heartbeat stale", reason)
+        # One-shot alert until recovery. The marker is written only once the
+        # alert is delivered, so a failed POST is retried on the next run
+        # instead of being suppressed for the rest of the outage.
+        if not marker.exists() and _post_alert(webhook, "MAMMON heartbeat stale", reason):
             try:
                 marker.write_text(now.isoformat())
             except Exception:  # noqa: BLE001

@@ -12,14 +12,14 @@ remote from ``BACKUP_REMOTE``); losing the droplet must not lose the ledger.
 
 import argparse
 import gzip
-import json
 import os
 import shutil
 import sqlite3
 import sys
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+
+from alert_webhook import post_webhook
 
 DEFAULT_DB = "data/mammon.db"
 DEFAULT_BACKUP_DIR = "data/backups"
@@ -46,14 +46,10 @@ def _post_error(title: str, message: str) -> None:
     if not webhook:
         return
     text = f"[ERROR] MAMMON: {title}\n{message}"
-    payload = json.dumps({"content": text, "text": text, "level": "error"}).encode()
-    req = urllib.request.Request(
-        webhook, data=payload, headers={"Content-Type": "application/json"}
-    )
     try:
-        urllib.request.urlopen(req, timeout=5)
-    except Exception:  # noqa: BLE001
-        pass
+        post_webhook(webhook, {"content": text, "text": text, "level": "error"})
+    except Exception as e:  # noqa: BLE001 - alerting is best-effort, but never silent
+        print(f"Alert POST failed: {e}", file=sys.stderr)
 
 
 def _prune(backup_dir: Path, keep: int) -> None:
