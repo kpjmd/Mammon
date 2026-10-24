@@ -269,9 +269,8 @@ class ScheduledOptimizer:
                     # Execute optimization cycle
                     await self._execute_optimization_cycle()
 
-                    # Update scan time
+                    # Update scan time (total_scans is counted per cycle)
                     self.status.last_scan_time = datetime.now(UTC)
-                    self.status.total_scans += 1
 
                     # Wait for next interval (or stop signal)
                     await asyncio.wait_for(
@@ -316,6 +315,9 @@ class ScheduledOptimizer:
         """
 
         executions: List[RebalanceExecution] = []
+        # Counted here, not in _run_loop: the autonomous runner drives cycles via
+        # run_once(), so a loop-only counter left the heartbeat's total_scans at 0.
+        self.status.total_scans += 1
 
         # Circuit breaker: once tripped, skip ALL action until an operator
         # resets it (scripts/resume_optimizer.py). The process stays alive so
@@ -350,6 +352,7 @@ class ScheduledOptimizer:
             recommendations = await self.optimizer.find_rebalance_opportunities(
                 current_positions
             )
+            await self._record_strategy_rejections()
 
             if not recommendations:
                 # Check if we have idle capital to deploy
@@ -361,6 +364,11 @@ class ScheduledOptimizer:
 
                     deployment_executions = await self._deploy_idle_capital(idle_capital)
                     executions.extend(deployment_executions)
+                elif current_positions:
+                    logger.info(
+                        f"No rebalance recommended for {len(current_positions)} "
+                        f"position(s) and no idle capital - holding"
+                    )
                 else:
                     logger.info("No positions and no idle capital - nothing to do")
 
@@ -682,6 +690,7 @@ class ScheduledOptimizer:
             # protocol) is left active rather than falsely closed.
             seen: set = set()
             checked: set = set()
+            unsupported: set = set()
             for opp in opps:
                 proto_obj = proto_by_name.get(opp.protocol)
                 if proto_obj is None:
@@ -699,6 +708,12 @@ class ScheduledOptimizer:
                         balance = await proto_obj.get_user_balance(
                             opp.pool_id, wallet
                         )
+                    except NotImplementedError:
+                        # Capability gap (e.g. Morpho), not a transient failure:
+                        # no retry, summarized once per sweep below.
+                        unsupported.add(opp.protocol)
+                        balance = None
+                        break
                     except Exception as e:
                         logger.warning(
                             f"reconcile_positions: failed to read balance "
@@ -748,6 +763,12 @@ class ScheduledOptimizer:
                         f"{opp.protocol}/{opp.pool_id}: {e}"
                     )
                     continue
+
+            if unsupported:
+                logger.info(
+                    f"reconcile_positions: balance reads not implemented for "
+                    f"{sorted(unsupported)}; their pools were not checked"
+                )
 
             # Close positions we CONFIRMED the wallet no longer holds on-chain
             # (read this sweep, balance 0). Close at the LAST TRACKED value (not
@@ -939,6 +960,30 @@ class ScheduledOptimizer:
                 )
         except Exception as e:
             logger.error(f"Failed to record decision: {e}", exc_info=True)
+
+    async def _record_strategy_rejections(self) -> None:
+        """Persist the alternatives the strategy declined, then clear them.
+
+        Strategy-level skips (APY threshold, its own profitability check) happen
+        before this class's gates, so without this a hold leaves no row in the
+        decisions table. Consumed so a cycle where the strategy is never called
+        (no positions) cannot re-record the previous cycle's list.
+        """
+        strategy = getattr(self.optimizer, "strategy", None)
+        rejections = getattr(strategy, "last_rejections", None)
+        if not isinstance(rejections, list) or not rejections:
+            return
+        pending = list(rejections)
+        rejections.clear()
+        for rejection in pending:
+            await self._record_decision(
+                decision_type="rebalance",
+                rationale=rejection.reason,
+                from_protocol=rejection.from_protocol,
+                to_protocol=rejection.to_protocol,
+                approved=-1,
+                expected_apy_improvement=rejection.apy_improvement,
+            )
 
     async def _deploy_idle_capital(
         self, idle_capital: Dict[str, Decimal]

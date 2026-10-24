@@ -92,6 +92,8 @@ class CircuitBreaker:
                 circuit.failure_count = 0
                 circuit.is_open = False
                 circuit.opened_at = None
+                # Clear it so the reset logs once, not on every later success.
+                circuit.last_failure_time = None
 
     def record_failure(self, protocol: str, error: Optional[Exception] = None) -> None:
         """Record failed operation for a protocol."""
