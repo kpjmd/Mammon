@@ -70,7 +70,8 @@ async def test_assess_protocol_morpho_medium_risk(risk_assessor):
 
     # Should be MEDIUM or HIGH due to high utilization
     assert assessment.risk_level in [RiskLevel.MEDIUM, RiskLevel.HIGH]
-    assert assessment.factors["protocol_safety_score"] == 90
+    # "Morpho" is the allowlisted MetaMorpho vault: Blue core + curator layer.
+    assert assessment.factors["protocol_safety_score"] == 85
     assert assessment.factors["tvl_risk_level"] == "MODERATE"
     assert assessment.factors["utilization_risk_level"] == "HIGH"
 

@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 from decimal import Decimal
 from datetime import datetime, UTC, timedelta
 from src.protocols.aerodrome import AerodromeProtocol
-from src.protocols.morpho import MorphoProtocol
+from src.protocols.morpho_vault import MorphoVaultProtocol
 from src.protocols.aave import AaveV3Protocol
 from src.protocols.moonwell import MoonwellProtocol
 from src.data.oracles import create_price_oracle
@@ -131,7 +131,9 @@ class YieldScannerAgent:
             "read_only": config.get("read_only", True),
             "price_oracle": self.price_oracle,  # Share oracle across all protocols
         }
-        self.morpho = MorphoProtocol(protocol_config)
+        # "Morpho" is the allowlisted MetaMorpho USDC vault (ERC-4626), not raw
+        # Morpho Blue markets: a vault is executable like a lending pool.
+        self.morpho = MorphoVaultProtocol(protocol_config)
         self.aave = AaveV3Protocol(protocol_config)
         self.moonwell = MoonwellProtocol(protocol_config)
 
@@ -146,7 +148,7 @@ class YieldScannerAgent:
 
         logger.info(f"YieldScannerAgent initialized with {len(self.protocols)} protocol(s)")
         logger.info(f"  - Aerodrome (DEX)")
-        logger.info(f"  - Morpho (Lending)")
+        logger.info(f"  - Morpho (Lending, allowlisted vault)")
         logger.info(f"  - Aave V3 (Lending)")
         logger.info(f"  - Moonwell (Lending)")
         logger.info(f"🔒 Circuit breaker: {MAX_CONSECUTIVE_FAILURES} failures, {CIRCUIT_BREAKER_COOLDOWN_SECONDS}s timeout")

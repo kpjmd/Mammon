@@ -628,6 +628,36 @@ class RebalanceExecutor:
             "Will be added in Phase 5."
         )
 
+    async def _deposit_amount(self, recommendation: RebalanceRecommendation) -> Decimal:
+        """Amount to approve/deposit after the withdraw step.
+
+        A full-exit withdraw (e.g. a Morpho vault redeem of every share) can
+        return a wei or two less than the tracked amount, which would make an
+        exact-amount deposit revert and strand the funds idle. If the wallet
+        holds less than the recommended amount by at most dust (the same
+        $0.01 / 0.1% tolerance the vault full-exit uses), deposit what it
+        holds. A larger shortfall is a real problem: keep the recommended
+        amount so the deposit fails loudly instead of silently shrinking.
+        """
+        from src.blockchain.protocol_action_executor import (
+            VAULT_FULL_EXIT_DUST_ABS,
+            VAULT_FULL_EXIT_DUST_REL,
+        )
+
+        amount = recommendation.amount
+        if recommendation.from_protocol is None:
+            return amount  # idle deploy: nothing was withdrawn
+        balance = await self.protocol_executor.get_token_balance(recommendation.token)
+        shortfall = amount - balance
+        dust = max(VAULT_FULL_EXIT_DUST_ABS, amount * VAULT_FULL_EXIT_DUST_REL)
+        if Decimal("0") < shortfall <= dust:
+            logger.info(
+                f"Depositing wallet balance {balance} {recommendation.token} "
+                f"(withdraw returned {shortfall} less than {amount})"
+            )
+            return balance
+        return amount
+
     async def _execute_approve_deposit_step(
         self,
         recommendation: RebalanceRecommendation,
@@ -642,6 +672,7 @@ class RebalanceExecutor:
             # Get protocol contract address for approval
             # For Aave V3, approve the Pool contract
             # For Moonwell, approve the mToken contract
+            # For Morpho, approve the allowlisted vault (exact amount)
             from src.blockchain.protocol_action_executor import (
                 AAVE_V3_POOL_ADDRESSES,
                 MOONWELL_MTOKEN_ADDRESSES,
@@ -658,6 +689,12 @@ class RebalanceExecutor:
                     raise ValueError(
                         f"Moonwell mToken not configured for {recommendation.token} on {network}"
                     )
+            elif recommendation.to_protocol == "Morpho":
+                from src.protocols.morpho_vault import get_vault_spec
+
+                network = self.config.get("network", "base-sepolia")
+                # Raises ValueError if no vault is allowlisted for this token.
+                spender = get_vault_spec(recommendation.token, network).address
             else:
                 raise NotImplementedError(
                     f"Approval not yet implemented for {recommendation.to_protocol}"
@@ -666,7 +703,7 @@ class RebalanceExecutor:
             result = await self.protocol_executor.execute_approve(
                 token=recommendation.token,
                 spender=spender,
-                amount=recommendation.amount,
+                amount=await self._deposit_amount(recommendation),
             )
 
             execution.add_step_result(
@@ -705,7 +742,7 @@ class RebalanceExecutor:
             result = await self.protocol_executor.execute_deposit(
                 protocol_name=recommendation.to_protocol,
                 token=recommendation.token,
-                amount=recommendation.amount,
+                amount=await self._deposit_amount(recommendation),
             )
 
             execution.add_step_result(

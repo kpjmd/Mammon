@@ -3,13 +3,22 @@
 This module handles transaction execution for DeFi protocols (withdraw, deposit, approve)
 while keeping transaction logic separate from read-only protocol implementations.
 
-Phase 4 Sprint 3: Aave V3, Moonwell, and Morpho support.
+Phase 4 Sprint 3: Aave V3, Moonwell, and Morpho support. "Morpho" is the
+allowlisted MetaMorpho (ERC-4626) vault from src/protocols/morpho_vault.py.
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from decimal import Decimal
 from web3 import Web3
 from src.blockchain.wallet import WalletManager
+from src.protocols.morpho_vault import (
+    DEFAULT_MAX_FEE,
+    DEFAULT_MIN_TIMELOCK_SECONDS,
+    METAMORPHO_ABI,
+    VaultSpec,
+    get_vault_spec,
+    verify_vault_config,
+)
 from src.security.audit import AuditLogger, AuditEventType, AuditSeverity
 from src.utils.logger import get_logger
 from src.utils.web3_provider import get_web3
@@ -40,12 +49,6 @@ MOONWELL_MTOKEN_ADDRESSES = {
         "USDC": "0xEdc817A28E8B93B03976FBd4a3dDBc9f7D176c22",  # Using mainnet for testing
         "WETH": "0x628ff693426583D9a7FB391E54366292F509D457",  # Using mainnet for testing
     },
-}
-
-# Morpho Blue contract addresses
-MORPHO_BLUE_ADDRESSES = {
-    "base-mainnet": "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb",
-    "base-sepolia": "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb",  # Using mainnet for testing
 }
 
 # Aave V3 Pool ABI for transactions
@@ -105,66 +108,6 @@ MOONWELL_MTOKEN_ABI = [
     },
 ]
 
-# Morpho Blue ABI (simplified)
-MORPHO_BLUE_ABI = [
-    # supply(MarketParams memory marketParams, uint256 assets, uint256 shares, address onBehalf, bytes memory data)
-    {
-        "inputs": [
-            {
-                "components": [
-                    {"internalType": "address", "name": "loanToken", "type": "address"},
-                    {"internalType": "address", "name": "collateralToken", "type": "address"},
-                    {"internalType": "address", "name": "oracle", "type": "address"},
-                    {"internalType": "address", "name": "irm", "type": "address"},
-                    {"internalType": "uint256", "name": "lltv", "type": "uint256"},
-                ],
-                "internalType": "struct MarketParams",
-                "name": "marketParams",
-                "type": "tuple",
-            },
-            {"internalType": "uint256", "name": "assets", "type": "uint256"},
-            {"internalType": "uint256", "name": "shares", "type": "uint256"},
-            {"internalType": "address", "name": "onBehalf", "type": "address"},
-            {"internalType": "bytes", "name": "data", "type": "bytes"},
-        ],
-        "name": "supply",
-        "outputs": [
-            {"internalType": "uint256", "name": "assetsSupplied", "type": "uint256"},
-            {"internalType": "uint256", "name": "sharesSupplied", "type": "uint256"},
-        ],
-        "stateMutability": "nonpayable",
-        "type": "function",
-    },
-    # withdraw(MarketParams memory marketParams, uint256 assets, uint256 shares, address onBehalf, address receiver)
-    {
-        "inputs": [
-            {
-                "components": [
-                    {"internalType": "address", "name": "loanToken", "type": "address"},
-                    {"internalType": "address", "name": "collateralToken", "type": "address"},
-                    {"internalType": "address", "name": "oracle", "type": "address"},
-                    {"internalType": "address", "name": "irm", "type": "address"},
-                    {"internalType": "uint256", "name": "lltv", "type": "uint256"},
-                ],
-                "internalType": "struct MarketParams",
-                "name": "marketParams",
-                "type": "tuple",
-            },
-            {"internalType": "uint256", "name": "assets", "type": "uint256"},
-            {"internalType": "uint256", "name": "shares", "type": "uint256"},
-            {"internalType": "address", "name": "onBehalf", "type": "address"},
-            {"internalType": "address", "name": "receiver", "type": "address"},
-        ],
-        "name": "withdraw",
-        "outputs": [
-            {"internalType": "uint256", "name": "assetsWithdrawn", "type": "uint256"},
-            {"internalType": "uint256", "name": "sharesWithdrawn", "type": "uint256"},
-        ],
-        "stateMutability": "nonpayable",
-        "type": "function",
-    },
-]
-
 # ERC20 ABI for approve and balance checks
 ERC20_ABI = [
     {
@@ -192,6 +135,23 @@ ERC20_ABI = [
         "type": "function",
     },
 ]
+
+ALLOWANCE_ABI = {
+    "inputs": [
+        {"internalType": "address", "name": "owner", "type": "address"},
+        {"internalType": "address", "name": "spender", "type": "address"},
+    ],
+    "name": "allowance",
+    "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+    "stateMutability": "view",
+    "type": "function",
+}
+
+# A Morpho vault withdraw within this much of the whole position redeems every
+# share instead (no stranded dust; a tracked amount that lags accrued interest
+# or slightly overstates the balance cannot revert).
+VAULT_FULL_EXIT_DUST_ABS = Decimal("0.01")
+VAULT_FULL_EXIT_DUST_REL = Decimal("0.001")
 
 # Token addresses on Base networks
 TOKEN_ADDRESSES = {
@@ -387,7 +347,7 @@ class ProtocolActionExecutor:
         elif protocol_name == "Moonwell":
             return await self._withdraw_moonwell(token, amount)
         elif protocol_name == "Morpho":
-            return await self._withdraw_morpho(token, amount)
+            return await self._withdraw_morpho_vault(token, amount)
         else:
             raise NotImplementedError(
                 f"Transaction execution not yet supported for {protocol_name}. "
@@ -419,7 +379,7 @@ class ProtocolActionExecutor:
         elif protocol_name == "Moonwell":
             return await self._deposit_moonwell(token, amount)
         elif protocol_name == "Morpho":
-            return await self._deposit_morpho(token, amount)
+            return await self._deposit_morpho_vault(token, amount)
         else:
             raise NotImplementedError(
                 f"Transaction execution not yet supported for {protocol_name}. "
@@ -864,86 +824,192 @@ class ProtocolActionExecutor:
         return result
 
     # ================================================================
-    # MORPHO BLUE PROTOCOL METHODS
+    # MORPHO VAULT (METAMORPHO / ERC-4626) METHODS
     # ================================================================
 
-    async def _deposit_morpho(self, token: str, amount: Decimal) -> Dict[str, Any]:
-        """Execute Morpho Blue deposit.
-
-        Args:
-            token: Token symbol to deposit
-            amount: Amount to deposit
-
-        Returns:
-            Transaction receipt
-
-        Note:
-            Morpho Blue requires market parameters. This is a simplified implementation
-            that would need to be extended with proper market selection logic.
-        """
-        logger.warning(
-            f"Morpho deposit for {token}: Simplified implementation. "
-            "Production version needs proper market parameter selection."
+    def _morpho_vault(self, token: str) -> Tuple[VaultSpec, Any]:
+        """Resolve the allowlisted vault for a token and its contract."""
+        spec = get_vault_spec(token, self.network)
+        vault = self.w3.eth.contract(
+            address=Web3.to_checksum_address(spec.address), abi=METAMORPHO_ABI
         )
+        return spec, vault
 
+    async def _send_vault_tx(
+        self, to: str, fn: Any, wallet_address: str
+    ) -> Tuple[str, Any]:
+        """Build, send and wait for a contract call; returns (hash, receipt)."""
+        tx_data = fn.build_transaction({
+            "from": wallet_address,
+            "nonce": self.w3.eth.get_transaction_count(wallet_address),
+        })
+        tx_hash = await self.wallet.send_transaction(
+            to=to, data=tx_data["data"], value=Decimal("0")
+        )
+        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
+        return tx_hash, receipt
+
+    async def _approve_vault_exact(
+        self, spec: VaultSpec, amount_raw: int, wallet_address: str
+    ) -> Optional[Dict[str, Any]]:
+        """Approve exactly `amount_raw` of the asset to the vault if needed.
+
+        Deliberately not a max-uint approval: a vault is a curator-governed
+        contract, so it never holds a standing allowance beyond this deposit.
+        Returns a failure result dict, or None on success / no-op.
+        """
+        token_contract = self.w3.eth.contract(
+            address=Web3.to_checksum_address(spec.asset), abi=ERC20_ABI + [ALLOWANCE_ABI]
+        )
+        allowance = token_contract.functions.allowance(wallet_address, spec.address).call()
+        if allowance >= amount_raw:
+            return None
+        tx_hash, receipt = await self._send_vault_tx(
+            spec.asset,
+            token_contract.functions.approve(spec.address, amount_raw),
+            wallet_address,
+        )
+        if receipt["status"] != 1:
+            return {"success": False, "error": "Approval transaction failed", "tx_hash": tx_hash}
+        logger.info(f"✅ Approved {amount_raw} raw {spec.token} to {spec.label}: {tx_hash}")
+        return None
+
+    async def _deposit_morpho_vault(self, token: str, amount: Decimal) -> Dict[str, Any]:
+        """Deposit into the allowlisted Morpho vault (ERC-4626 deposit).
+
+        Re-verifies the pinned vault config first (defense in depth: the scan
+        already did, but state may have changed since) and refuses amounts
+        above maxDeposit (supply caps full).
+        """
+        spec, vault = self._morpho_vault(token)
+        wallet_address = await self.wallet.get_address()
+        amount_raw = int(amount * Decimal(10**spec.asset_decimals))
+        if amount_raw <= 0:
+            raise ValueError(f"Invalid Morpho vault deposit amount: {amount}")
+
+        verify_vault_config(
+            self.w3,
+            spec,
+            int(self.config.get("morpho_vault_min_timelock_seconds", DEFAULT_MIN_TIMELOCK_SECONDS)),
+            Decimal(str(self.config.get("morpho_vault_max_fee", DEFAULT_MAX_FEE))),
+        )
+        max_deposit = vault.functions.maxDeposit(wallet_address).call()
+        if amount_raw > max_deposit:
+            raise ValueError(
+                f"{spec.label}: deposit {amount} {token} exceeds maxDeposit "
+                f"({Decimal(max_deposit) / Decimal(10**spec.asset_decimals)})"
+            )
+
+        logger.info(f"Depositing {amount} {token} to Morpho vault {spec.label}...")
         if self.dry_run_mode:
-            logger.info(f"[DRY RUN] Would deposit {amount} {token} to Morpho")
+            logger.info(f"[DRY RUN] Would deposit {amount} {token} to {spec.label}")
             return {
                 "success": True,
                 "tx_hash": f"0xdryrun_deposit_morpho_{token}",
-                "gas_used": 250000,
+                "gas_used": 300000,
                 "dry_run": True,
             }
 
-        # In production, we would:
-        # 1. Query available Morpho markets for this token
-        # 2. Select the best market based on APY/risk
-        # 3. Build market parameters struct
-        # 4. Execute supply transaction
-
-        raise NotImplementedError(
-            "Morpho deposit requires market parameter selection. "
-            "This will be implemented in a future sprint with proper market discovery."
+        failure = await self._approve_vault_exact(spec, amount_raw, wallet_address)
+        if failure:
+            return failure
+        tx_hash, receipt = await self._send_vault_tx(
+            spec.address, vault.functions.deposit(amount_raw, wallet_address), wallet_address
         )
+        return await self._vault_result("deposit", spec, token, amount, tx_hash, receipt)
 
-    async def _withdraw_morpho(self, token: str, amount: Decimal) -> Dict[str, Any]:
-        """Execute Morpho Blue withdrawal.
+    async def _withdraw_morpho_vault(self, token: str, amount: Decimal) -> Dict[str, Any]:
+        """Withdraw from the allowlisted Morpho vault.
 
-        Args:
-            token: Token symbol to withdraw
-            amount: Amount to withdraw
-
-        Returns:
-            Transaction receipt
-
-        Note:
-            Morpho Blue requires market parameters. This is a simplified implementation
-            that would need to be extended with proper market selection logic.
+        If `amount` covers (nearly) the whole position, redeem every share so
+        no dust is stranded and a stale tracked amount slightly above the real
+        balance cannot revert. Otherwise withdraw exactly `amount`. Either way,
+        refuse before broadcasting if the vault lacks the liquidity
+        (maxWithdraw). Not gated by the vault guard: exits must always work.
         """
-        logger.warning(
-            f"Morpho withdraw for {token}: Simplified implementation. "
-            "Production version needs proper market parameter selection."
-        )
+        spec, vault = self._morpho_vault(token)
+        wallet_address = await self.wallet.get_address()
+        scale = Decimal(10**spec.asset_decimals)
+        shares = vault.functions.balanceOf(wallet_address).call()
+        if shares == 0:
+            raise ValueError(f"No {spec.label} shares to withdraw")
+        position_raw = vault.functions.previewRedeem(shares).call()
+        amount_raw = int(amount * scale)
+        if amount_raw <= 0:
+            raise ValueError(f"Invalid Morpho vault withdraw amount: {amount}")
 
+        dust_raw = max(
+            int(VAULT_FULL_EXIT_DUST_ABS * scale), int(position_raw * VAULT_FULL_EXIT_DUST_REL)
+        )
+        full_exit = amount_raw >= position_raw - dust_raw
+        expected_raw = position_raw if full_exit else amount_raw
+        max_withdraw = vault.functions.maxWithdraw(wallet_address).call()
+        if expected_raw > max_withdraw:
+            raise ValueError(
+                f"{spec.label}: withdraw {Decimal(expected_raw) / scale} {token} exceeds "
+                f"available liquidity (maxWithdraw {Decimal(max_withdraw) / scale})"
+            )
+
+        mode = "redeem" if full_exit else "withdraw"
+        logger.info(f"Withdrawing {Decimal(expected_raw) / scale} {token} from {spec.label} ({mode})...")
         if self.dry_run_mode:
-            logger.info(f"[DRY RUN] Would withdraw {amount} {token} from Morpho")
+            logger.info(f"[DRY RUN] Would {mode} {Decimal(expected_raw) / scale} {token} from {spec.label}")
             return {
                 "success": True,
                 "tx_hash": f"0xdryrun_withdraw_morpho_{token}",
-                "gas_used": 200000,
+                "gas_used": 350000,
                 "dry_run": True,
+                "mode": mode,
             }
 
-        # In production, we would:
-        # 1. Query user's Morpho positions
-        # 2. Get market parameters for the position
-        # 3. Build withdraw transaction with market params
-        # 4. Execute withdraw
-
-        raise NotImplementedError(
-            "Morpho withdrawal requires market parameter selection. "
-            "This will be implemented in a future sprint with proper position tracking."
+        fn = (
+            vault.functions.redeem(shares, wallet_address, wallet_address)
+            if full_exit
+            else vault.functions.withdraw(amount_raw, wallet_address, wallet_address)
         )
+        tx_hash, receipt = await self._send_vault_tx(spec.address, fn, wallet_address)
+        result = await self._vault_result(
+            "withdraw", spec, token, Decimal(expected_raw) / scale, tx_hash, receipt
+        )
+        result["mode"] = mode
+        return result
+
+    async def _vault_result(
+        self,
+        action: str,
+        spec: VaultSpec,
+        token: str,
+        amount: Decimal,
+        tx_hash: str,
+        receipt: Any,
+    ) -> Dict[str, Any]:
+        """Audit-log a confirmed vault tx and build the standard result dict."""
+        success = receipt["status"] == 1
+        await self.audit_logger.log_event(
+            AuditEventType.TRANSACTION_SUBMITTED,
+            AuditSeverity.INFO if success else AuditSeverity.ERROR,
+            f"Morpho vault {action} {amount} {token} ({spec.label})",
+            metadata={
+                "protocol": "Morpho",
+                "vault": spec.address,
+                "token": token,
+                "amount": str(amount),
+                "tx_hash": tx_hash,
+                "success": success,
+            },
+        )
+        if success:
+            logger.info(f"✅ Morpho vault {action} {amount} {token}: {tx_hash}")
+        else:
+            logger.error(f"❌ Morpho vault {action} reverted: {tx_hash}")
+        return {
+            "success": success,
+            "tx_hash": tx_hash,
+            "gas_used": receipt["gasUsed"],
+            "block_number": receipt["blockNumber"],
+            "protocol": "Morpho",
+            "action": action,
+        }
 
     # ================================================================
     # UNISWAP V3 SWAP METHODS

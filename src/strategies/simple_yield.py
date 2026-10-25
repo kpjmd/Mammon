@@ -68,10 +68,11 @@ class SimpleYieldStrategy(BaseStrategy):
         self.target_token = config.get("target_token", "USDC")
 
         # Protocol whitelist (only fully implemented protocols)
-        # TODO: Implement approval/deposit for: Aerodrome, Morpho
+        # Executable venues: "Aave V3", "Moonwell", "Morpho" (allowlisted vault).
+        # Override via SUPPORTED_PROTOCOLS (wired by the runner's config).
         self.supported_protocols = config.get(
             "supported_protocols",
-            ["Aave V3", "Moonwell"]  # Only these have working approval/deposit
+            ["Aave V3", "Moonwell"]  # Venues validated live end to end
         )
 
         logger.info(

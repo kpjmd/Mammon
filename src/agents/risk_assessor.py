@@ -4,7 +4,7 @@ This module implements the agent responsible for assessing risks
 of yield opportunities and rebalancing decisions.
 
 Risk Framework:
-- Protocol Safety Scores: Aave V3 (95), Morpho (90), Moonwell (85), Aerodrome (85)
+- Protocol Safety Scores: Aave V3 (95), Morpho vault (85), Moonwell (85), Aerodrome (85)
 - Risk Levels: LOW (0-25), MEDIUM (26-50), HIGH (51-75), CRITICAL (76-100)
 - Decision Gates: CRITICAL blocks execution, HIGH requires elevated approval
 """
@@ -81,7 +81,7 @@ class RiskAssessorAgent:
 
     Protocol Safety Scores (inverse scale: lower risk = higher safety):
     - Aave V3: 95/100 (battle-tested, $125M+ TVL on Base)
-    - Morpho: 90/100 (Coinbase-promoted, $45M+ TVL)
+    - Morpho: 85/100 (allowlisted MetaMorpho vault; Blue core + curator risk)
     - Moonwell: 85/100 (Compound V2 fork, $32M+ TVL)
     - Aerodrome: 85/100 (Velodrome fork, $602M+ TVL)
 
@@ -103,8 +103,11 @@ class RiskAssessorAgent:
     PROTOCOL_SAFETY_SCORES = {
         "Aave V3": 95,
         "Aave": 95,  # Alias
-        "Morpho": 90,
-        "Morpho Blue": 90,  # Alias
+        # "Morpho" is the allowlisted MetaMorpho vault (src/protocols/
+        # morpho_vault.py): Morpho Blue core plus a curator layer, so one notch
+        # below the core. Curator/fee/timelock drift is caught by pinned guards.
+        "Morpho": 85,
+        "Morpho Blue": 90,  # Alias (raw Blue markets; not traded)
         "Moonwell": 85,
         "Aerodrome": 85,
     }
