@@ -57,3 +57,7 @@ Thumbs.db
 *.key
 wallet_seed*
 private_key*
+
+# Morpho vault guard latch (runtime state, never commit)
+data/morpho_vault_guard.json
+data/morpho_vault_guard.tmp

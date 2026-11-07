@@ -301,14 +301,21 @@ class RebalanceExecutor:
             if self._requires_swap(recommendation):
                 await self._execute_swap_step(recommendation, execution)
 
+            # Approve and deposit the SAME amount, fixed once after the
+            # withdraw: two separate balance reads could diverge and leave the
+            # deposit above an exact-amount allowance (revert).
+            deposit_amount = await self._deposit_amount(recommendation)
+
             # Step 5: Approve target protocol
-            await self._execute_approve_deposit_step(recommendation, execution)
+            await self._execute_approve_deposit_step(
+                recommendation, execution, deposit_amount
+            )
             await self._update_intent(
                 intent_id, last_step=RebalanceStep.APPROVE_DEPOSIT.value
             )
 
             # Step 6: Deposit to target protocol
-            await self._execute_deposit_step(recommendation, execution)
+            await self._execute_deposit_step(recommendation, execution, deposit_amount)
             await self._update_intent(
                 intent_id,
                 last_step=RebalanceStep.DEPOSIT.value,
@@ -662,6 +669,7 @@ class RebalanceExecutor:
         self,
         recommendation: RebalanceRecommendation,
         execution: RebalanceExecution,
+        amount: Optional[Decimal] = None,
     ) -> None:
         """Execute approval for target protocol deposit."""
         logger.info(
@@ -703,7 +711,7 @@ class RebalanceExecutor:
             result = await self.protocol_executor.execute_approve(
                 token=recommendation.token,
                 spender=spender,
-                amount=await self._deposit_amount(recommendation),
+                amount=amount if amount is not None else recommendation.amount,
             )
 
             execution.add_step_result(
@@ -731,6 +739,7 @@ class RebalanceExecutor:
         self,
         recommendation: RebalanceRecommendation,
         execution: RebalanceExecution,
+        amount: Optional[Decimal] = None,
     ) -> None:
         """Execute deposit to target protocol."""
         logger.info(
@@ -742,7 +751,7 @@ class RebalanceExecutor:
             result = await self.protocol_executor.execute_deposit(
                 protocol_name=recommendation.to_protocol,
                 token=recommendation.token,
-                amount=await self._deposit_amount(recommendation),
+                amount=amount if amount is not None else recommendation.amount,
             )
 
             execution.add_step_result(

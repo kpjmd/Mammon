@@ -72,3 +72,18 @@ def mammon_test_env(request, monkeypatch):
     monkeypatch.setattr(config_module, "_settings", None, raising=False)
     yield
     config_module._settings = None
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_morpho_vault_guard_state(tmp_path, monkeypatch):
+    """Point the Morpho vault guard's default state file at a per-test tmp path.
+
+    The guard persists its share-price latch to disk; without this, any test
+    that scans the vault would write data/morpho_vault_guard.json into the repo
+    and leak a high-water mark (or a trip) into later tests.
+    """
+    import src.protocols.morpho_vault_guard as guard_module
+
+    monkeypatch.setattr(
+        guard_module, "DEFAULT_STATE_FILE", str(tmp_path / "morpho_vault_guard.json")
+    )

@@ -57,16 +57,28 @@ Every scan, and again right before every deposit, MAMMON checks:
 3. `fee() <= MORPHO_VAULT_MAX_FEE` (default 0.05).
 4. **Share price tripwire.** MetaMorpho v1.0 realizes bad debt by lowering the
    share price. If `convertToAssets(1e24)` drops more than 1bp below the
-   highest value seen by this process, the vault stays blocked until the
-   service restarts. The 1bp tolerance absorbs a lagging RPC replica, since 2h
-   of interest is about 0.1bp.
+   highest value ever recorded, the vault is **latched**. The 1bp tolerance
+   absorbs a lagging RPC replica, since 2h of interest is about 0.1bp.
+   - The latch and the high-water share price are persisted in
+     `data/morpho_vault_guard.json` (atomic writes, like the cycle circuit
+     breaker), so they survive restarts, the monthly duration rollover and the
+     exit procedure below. A post-loss price never becomes the new baseline.
+   - An unreadable state file fails **closed**: every vault reads as tripped.
+   - Only an operator reset clears a latch (see [Reset](#reset-after-investigating)).
 
 If any check fails:
 
 - The scan raises, so the vault drops out of the cycle and gets no new
-  deposits.
-- An ERROR is logged with `Vault guard tripped`, plus a CRITICAL `risk_alert`
-  audit event.
+  deposits. The executor re-runs checks 1–4 right before any deposit, so a
+  latched vault is refused even on a path the scan never vetted.
+- A **critical Discord alert** (`Morpho vault guard tripped`) goes out once per
+  distinct reason. The dedupe survives restarts and resets when the guard
+  passes again. An ERROR log line and a CRITICAL `risk_alert` audit event are
+  written as well.
+- **The optimizer holds the position.** A venue with no yield data this cycle
+  (guard trip, RPC error, timeout) is never read as 0% APY; the strategy holds
+  it and records a rejected `rebalance` decision ("no yield data"). The same
+  applies to Aave V3 and Moonwell if their scans fail.
 - Any vault position stays tracked; reconcile never closes a row it couldn't
   read.
 - **Withdrawals are never gated.** You can always get out.
@@ -75,8 +87,9 @@ Deposits also refuse amounts above `maxDeposit` (vault supply caps full).
 Withdrawals refuse amounts above `maxWithdraw`, which is the vault's
 withdrawable liquidity, before broadcasting anything.
 
-The optimizer will **not** exit the vault on its own when a guard trips,
-because the vault vanishes from the scan. Exit manually:
+The optimizer will **not** exit the vault on its own when a guard trips: the
+vault vanishes from the scan and the strategy holds. Exit manually when the
+alert arrives:
 
 ```bash
 sudo systemctl stop mammon.service
@@ -86,8 +99,26 @@ cd /root/mammon
 sudo systemctl start mammon.service
 ```
 
-The next cycle's reconcile closes the vault row and idle-deploy picks up the
-USDC.
+- `--live` refuses to broadcast while `mammon.service` is active (the two
+  processes would race on the wallet nonce); `--force` overrides.
+- A successful live exit **latches** the vault guard, even when the trip was a
+  non-latching check such as a curator change. The restarted loop therefore
+  won't redeposit into the vault.
+
+The next cycle's reconcile closes the vault row and idle-deploy puts the USDC
+into Aave V3 or Moonwell.
+
+### Reset after investigating
+
+```bash
+/root/.local/bin/poetry run python scripts/reset_morpho_vault_guard.py            # show state
+/root/.local/bin/poetry run python scripts/reset_morpho_vault_guard.py --confirm  # clear the latch
+```
+
+Resetting also drops the stored high-water share price, so the next scan
+adopts the current price as its baseline. Do it only once you've decided the
+vault is healthy enough to use again. To keep the vault out permanently,
+remove `Morpho` from `SUPPORTED_PROTOCOLS` instead.
 
 ## APY convention
 
@@ -124,7 +155,10 @@ above if you want it gone.
 
 - Unit: `tests/unit/protocols/test_morpho_vault.py`,
   `tests/unit/blockchain/test_protocol_action_executor_morpho_vault.py`,
-  `tests/unit/test_morpho_vault_wiring.py`, `tests/unit/test_morpho_vault_exit_script.py`.
+  `tests/unit/test_morpho_vault_wiring.py`, `tests/unit/test_morpho_vault_exit_script.py`,
+  `tests/unit/protocols/test_morpho_vault_guard.py` (persisted latch, alert
+  dedupe, non-blocking scan), `tests/unit/strategies/test_missing_venue_yield.py`,
+  `tests/unit/test_reset_morpho_vault_guard.py`.
 - Fork E2E against real vault state (deposit → balance → partial withdraw →
   full redeem, plus a full `RebalanceExecutor` idle→vault→Moonwell round
   trip):

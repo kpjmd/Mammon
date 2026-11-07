@@ -8,8 +8,12 @@ by the guard, so this script can always exit.
 
 Dry-run by default: reads the position and the vault's withdrawable liquidity
 and simulates the redeem. Broadcasting requires --live AND typing the
-confirmation phrase. Stop mammon.service first so the two processes never
-race on the wallet nonce.
+confirmation phrase, and is refused while mammon.service is active (the two
+processes would race on the wallet nonce and position) unless --force.
+
+A successful live exit latches the vault guard (persisted), so the restarted
+loop will not redeposit into the vault. Clear it only after investigating,
+with scripts/reset_morpho_vault_guard.py --confirm.
 
 Usage (on the droplet, from /root/mammon):
     sudo systemctl stop mammon.service
@@ -26,18 +30,38 @@ sys.path.insert(0, str(project_root))
 
 import argparse
 import asyncio
+import shutil
+import subprocess
 from decimal import Decimal
+from typing import Optional
 
 from src.blockchain.protocol_action_executor import ProtocolActionExecutor
 from src.blockchain.wallet import WalletManager
 from src.data.oracles import create_price_oracle
 from src.protocols.morpho_vault import MorphoVaultProtocol, get_vault_spec
+from src.protocols.morpho_vault_guard import VaultGuardStore
 from src.utils.logger import setup_logging
 
 CONFIRMATION = "EXIT MORPHO VAULT"
+SERVICE = "mammon.service"
 
 
-async def main(live: bool) -> int:
+def service_state() -> Optional[str]:
+    """`systemctl is-active` for the loop, or None where systemd is absent."""
+    if shutil.which("systemctl") is None:
+        return None
+    result = subprocess.run(
+        ["systemctl", "is-active", SERVICE], capture_output=True, text=True, check=False
+    )
+    return result.stdout.strip() or None
+
+
+def loop_is_running() -> bool:
+    """True if the optimizer service is (or may soon be) running."""
+    return service_state() in {"active", "activating", "reloading"}
+
+
+async def main(live: bool, force: bool = False) -> int:
     from scripts.run_autonomous_optimizer import AutonomousRunner
 
     runner = AutonomousRunner(duration_hours=0.01, scan_interval_hours=1.0, dry_run=not live)
@@ -56,6 +80,13 @@ async def main(live: bool) -> int:
         return 0
 
     if live:
+        if loop_is_running() and not force:
+            print(
+                f"Refusing to broadcast: {SERVICE} is active and would race this "
+                f"script on the wallet nonce. Run `sudo systemctl stop {SERVICE}` "
+                f"first (or pass --force)."
+            )
+            return 2
         typed = input(f'Broadcast a full redeem? Type "{CONFIRMATION}" to proceed: ')
         if typed.strip() != CONFIRMATION:
             print("Aborted; nothing sent.")
@@ -65,11 +96,22 @@ async def main(live: bool) -> int:
     # share; it refuses before broadcasting if vault liquidity is insufficient.
     result = await executor.execute_withdraw("Morpho", "USDC", position + Decimal("1"))
     print(f"Result: {result}")
-    return 0 if result.get("success") else 1
+    if not result.get("success"):
+        return 1
+    if live:
+        VaultGuardStore(config.get("morpho_vault_guard_state_file")).latch(
+            spec.address, f"{spec.label}: operator exit via scripts/morpho_vault_exit.py"
+        )
+        print("Vault guard latched: no new deposits until scripts/reset_morpho_vault_guard.py.")
+    return 0
 
 
 if __name__ == "__main__":
     setup_logging()
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--live", action="store_true", help="broadcast (default: dry run)")
-    sys.exit(asyncio.run(main(parser.parse_args().live)))
+    parser.add_argument(
+        "--force", action="store_true", help=f"broadcast even if {SERVICE} is active"
+    )
+    args = parser.parse_args()
+    sys.exit(asyncio.run(main(args.live, args.force)))

@@ -15,7 +15,9 @@ Safety model (fail closed):
   raises VaultGuardError, so the vault drops out of the scan and receives no
   new deposits. Withdrawals are never gated by the guard.
 - MetaMorpho v1.0 realizes bad debt by lowering the share price, so a share
-  price drop beyond a small RPC-lag tolerance trips a sticky in-process flag.
+  price drop beyond a small RPC-lag tolerance latches a trip that is persisted
+  to disk (morpho_vault_guard.py) and survives restarts until an operator
+  reset.
 - No mock data in live mode: any read failure raises.
 
 APY is computed on-chain: the vault's allocation-weighted Morpho Blue supply
@@ -23,6 +25,7 @@ rate, net of the vault fee. Rates use the same linear (APR) convention as the
 Moonwell integration, which reads ~0.1pt below Morpho's compounded UI figure.
 """
 
+import asyncio
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
@@ -36,6 +39,8 @@ from src.utils.logger import get_logger
 from src.utils.web3_provider import get_web3
 
 from .base import BaseProtocol, ProtocolPool
+from .morpho_vault_guard import VaultGuardError as VaultGuardError  # re-export
+from .morpho_vault_guard import VaultGuardStore
 
 logger = get_logger(__name__)
 
@@ -48,11 +53,6 @@ VIRTUAL_SHARES = 10**6
 VIRTUAL_ASSETS = 1
 # 1e24 shares (1e6 whole shares at 18 decimals) gives a precise share price.
 SHARE_PRICE_SAMPLE_SHARES = 10**24
-# A lagging RPC replica can serve a block a few seconds old, i.e. a share price
-# a hair lower than the last read. Two hours of interest at 5% is ~0.1bp, so a
-# 1bp tolerance absorbs lag while still catching any bad-debt event that
-# matters.
-SHARE_PRICE_DROP_TOLERANCE = Decimal("0.0001")
 
 DEFAULT_MIN_TIMELOCK_SECONDS = 604800  # 7 days
 DEFAULT_MAX_FEE = Decimal("0.05")  # 5% performance fee ceiling
@@ -211,10 +211,6 @@ IRM_ABI: List[Dict[str, Any]] = [
         _U256,
     ),
 ]
-
-
-class VaultGuardError(Exception):
-    """The vault's on-chain state no longer matches its pinned allowlist."""
 
 
 @dataclass
@@ -393,8 +389,10 @@ class MorphoVaultProtocol(BaseProtocol):
         self.max_fee = Decimal(str(config.get("morpho_vault_max_fee", DEFAULT_MAX_FEE)))
         # Vault data is always read from mainnet, like the other lending reads.
         self.vaults = MORPHO_VAULTS["base-mainnet"]
-        self._last_share_price: Dict[str, int] = {}
-        self._tripped: Dict[str, str] = {}
+        self.guard_store = VaultGuardStore(config.get("morpho_vault_guard_state_file"))
+        # This scan's guard failure per vault (None = passed); feeds the
+        # scheduler's deduplicated alert via pop_guard_alerts().
+        self._guard_failures: Dict[str, Optional[str]] = {}
         self.web3: Optional[Web3] = None
         if not self.use_mock_data:
             self.web3 = get_web3("base-mainnet", config=get_settings())
@@ -424,23 +422,18 @@ class MorphoVaultProtocol(BaseProtocol):
             raise RuntimeError("MorphoVaultProtocol has no web3 (mock mode)")
         return self.web3
 
-    def _check_share_price(self, spec: VaultSpec, share_price: int) -> None:
-        """Trip (sticky) if the share price fell beyond the RPC-lag tolerance."""
-        if spec.address in self._tripped:
-            raise VaultGuardError(self._tripped[spec.address])
-        last = self._last_share_price.get(spec.address)
-        if last is not None and share_price < last:
-            drop = Decimal(last - share_price) / Decimal(last)
-            if drop > SHARE_PRICE_DROP_TOLERANCE:
-                reason = (
-                    f"{spec.label}: share price fell {drop:.6%} "
-                    f"({last} -> {share_price}); possible bad debt. Deposits "
-                    f"blocked until restart."
-                )
-                self._tripped[spec.address] = reason
-                raise VaultGuardError(reason)
-            return  # within tolerance: keep the higher reference
-        self._last_share_price[spec.address] = share_price
+    def pop_guard_alerts(self) -> List[str]:
+        """Guard failures not yet alerted on (once per distinct reason).
+
+        Called by the scheduler after each scan. The protocol layer holds no
+        alerter; it only reports what needs one.
+        """
+        alerts = []
+        for spec in self.vaults.values():
+            failure = self._guard_failures.get(spec.address)
+            if self.guard_store.should_alert(spec.address, failure):
+                alerts.append(failure or "")
+        return alerts
 
     async def _usd_price(self, token: str) -> Decimal:
         try:
@@ -453,9 +446,14 @@ class MorphoVaultProtocol(BaseProtocol):
     async def _build_pool(self, spec: VaultSpec) -> ProtocolPool:
         w3 = self._require_web3()
         try:
-            snapshot = verify_vault_config(w3, spec, self.min_timelock_seconds, self.max_fee)
-            self._check_share_price(spec, snapshot.share_price)
+            # Blocking web3 calls run in a worker thread so they never stall
+            # the other protocols' scans or the scanner's per-protocol timeout.
+            snapshot = await asyncio.to_thread(
+                verify_vault_config, w3, spec, self.min_timelock_seconds, self.max_fee
+            )
+            self.guard_store.check_share_price(spec.address, spec.label, snapshot.share_price)
         except VaultGuardError as e:
+            self._guard_failures[spec.address] = str(e)
             logger.error(f"[MORPHO] Vault guard tripped, excluding vault: {e}")
             await self.audit_logger.log_event(
                 AuditEventType.RISK_ALERT,
@@ -464,7 +462,8 @@ class MorphoVaultProtocol(BaseProtocol):
                 metadata={"protocol": PROTOCOL_NAME, "vault": spec.address},
             )
             raise
-        state = read_vault_state(w3, spec, snapshot)
+        self._guard_failures[spec.address] = None
+        state = await asyncio.to_thread(read_vault_state, w3, spec, snapshot)
         scale = Decimal(10**spec.asset_decimals)
         price = await self._usd_price(spec.token)
         return ProtocolPool(
@@ -549,13 +548,16 @@ class MorphoVaultProtocol(BaseProtocol):
         if self.use_mock_data:
             return Decimal("0")
         spec = self._spec_for_pool(pool_id)
+        assets = await asyncio.to_thread(self._read_user_assets, spec, user_address)
+        return Decimal(assets) / Decimal(10**spec.asset_decimals)
+
+    def _read_user_assets(self, spec: VaultSpec, user_address: str) -> int:
         w3 = self._require_web3()
         vault = w3.eth.contract(address=Web3.to_checksum_address(spec.address), abi=METAMORPHO_ABI)
         shares = int(vault.functions.balanceOf(Web3.to_checksum_address(user_address)).call())
         if shares == 0:
-            return Decimal("0")
-        assets = int(vault.functions.convertToAssets(shares).call())
-        return Decimal(assets) / Decimal(10**spec.asset_decimals)
+            return 0
+        return int(vault.functions.convertToAssets(shares).call())
 
     async def deposit(self, pool_id: str, token: str, amount: Decimal) -> str:
         """Execution lives in ProtocolActionExecutor; this class is read-only."""

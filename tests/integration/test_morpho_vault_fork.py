@@ -67,6 +67,14 @@ def _usdc_balance(w3: Web3, holder: str) -> Decimal:
     return Decimal(usdc.functions.balanceOf(holder).call()) / Decimal(10**6)
 
 
+@pytest.fixture(autouse=True)
+def _guard_state_in_tmp(tmp_path, monkeypatch):
+    """Keep the persisted vault guard latch out of the repo's data/ dir."""
+    import src.protocols.morpho_vault_guard as guard_module
+
+    monkeypatch.setattr(guard_module, "DEFAULT_STATE_FILE", str(tmp_path / "guard.json"))
+
+
 @pytest.fixture
 def fork() -> Any:
     w3 = Web3(Web3.HTTPProvider(FORK_RPC))

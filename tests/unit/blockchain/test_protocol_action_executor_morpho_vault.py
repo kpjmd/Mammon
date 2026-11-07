@@ -267,12 +267,45 @@ async def test_rebalance_deposits_balance_when_redeem_returned_dust_less():
     """A full-exit redeem 1 wei short must not make the exact deposit revert."""
     ex, protocol_executor = _rebalancer(wallet_usdc="49.999999")
 
-    await ex._execute_deposit_step(_rec(from_protocol="Morpho", to_protocol="Moonwell"),
-                                   MagicMock(spec=RebalanceExecution))
-
-    protocol_executor.execute_deposit.assert_awaited_once_with(
-        protocol_name="Moonwell", token="USDC", amount=Decimal("49.999999")
+    assert await ex._deposit_amount(_rec(from_protocol="Morpho", to_protocol="Moonwell")) == (
+        Decimal("49.999999")
     )
+
+
+def _live_rebalancer(balances):
+    """A live-mode RebalanceExecutor whose wallet balance reads return `balances`."""
+    ex, protocol_executor = _rebalancer()
+    ex.dry_run_mode = False
+    ex.config["dry_run_mode"] = False
+    protocol_executor.get_token_balance = AsyncMock(side_effect=[Decimal(b) for b in balances])
+    protocol_executor.execute_withdraw = AsyncMock(return_value={"success": True, "tx_hash": "0xw"})
+    ex._validate_recommendation = AsyncMock()
+    ex._check_initial_balances = AsyncMock()
+    ex._verify_final_balances = AsyncMock()
+    ex._calculate_actual_costs = AsyncMock()
+    ex._persist_transactions = AsyncMock()
+    ex._create_intent = AsyncMock(return_value=None)
+    ex._update_intent = AsyncMock()
+    ex.audit_logger = MagicMock()
+    ex.audit_logger.log_event = AsyncMock()
+    return ex, protocol_executor
+
+
+@pytest.mark.asyncio
+async def test_rebalance_approves_and_deposits_one_amount():
+    """The deposit amount is fixed once after the withdraw, not re-read per step.
+
+    Two reads that differ (49.999999 then 50) used to approve one amount and
+    deposit another, overrunning an exact allowance.
+    """
+    ex, protocol_executor = _live_rebalancer(["49.999999", "50", "50"])
+
+    execution = await ex.execute_rebalance(_rec(from_protocol="Morpho", to_protocol="Moonwell"))
+
+    assert execution.success, [s.error for s in execution.steps]
+    approved = protocol_executor.execute_approve.await_args.kwargs["amount"]
+    deposited = protocol_executor.execute_deposit.await_args.kwargs["amount"]
+    assert approved == deposited == Decimal("49.999999")
 
 
 @pytest.mark.asyncio

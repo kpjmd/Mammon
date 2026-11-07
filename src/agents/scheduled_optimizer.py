@@ -343,6 +343,7 @@ class ScheduledOptimizer:
             # optimizer (each used to scan on its own, doubling every
             # protocol API/RPC call and error line).
             opportunities = await self._scan_for_cycle()
+            await self._alert_vault_guards()
 
             # 0. Reconcile the positions table with on-chain truth before the
             # read below, so decisions see funds moved outside the loop (e.g. a
@@ -1234,6 +1235,35 @@ class ScheduledOptimizer:
         self.breaker.record_success()
         self._write_cycle_heartbeat(last_cycle_ok=True)
         return executions
+
+    async def _alert_vault_guards(self) -> None:
+        """Alert (critical, once per distinct reason) on Morpho vault guard trips.
+
+        The protocol layer records guard failures but holds no alerter; any
+        scanned protocol exposing pop_guard_alerts() reports what still needs
+        one. The response (manual exit) is time-sensitive, so this goes to the
+        webhook, not just the log. Best-effort: never fails the cycle.
+        """
+        for proto in getattr(self.yield_scanner, "protocols", None) or []:
+            pop = getattr(proto, "pop_guard_alerts", None)
+            if not callable(pop):
+                continue
+            try:
+                reasons = pop()
+            except Exception as e:  # noqa: BLE001 - alerting must not break a cycle
+                logger.error(f"Vault guard alert check failed: {e}")
+                continue
+            if not isinstance(reasons, list):
+                continue
+            for reason in reasons:
+                await self._safe_alert(
+                    "critical",
+                    "Morpho vault guard tripped",
+                    f"{reason}\nNew deposits are blocked. If you hold a vault "
+                    f"position, exit it: stop mammon.service, run "
+                    f"scripts/morpho_vault_exit.py --live, start the service "
+                    f"(docs/morpho_vault.md).",
+                )
 
     async def _safe_alert(self, level: str, title: str, message: str) -> None:
         """Fire an alert without ever letting it break the caller."""

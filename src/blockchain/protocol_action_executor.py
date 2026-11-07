@@ -19,6 +19,7 @@ from src.protocols.morpho_vault import (
     get_vault_spec,
     verify_vault_config,
 )
+from src.protocols.morpho_vault_guard import VaultGuardStore
 from src.security.audit import AuditLogger, AuditEventType, AuditSeverity
 from src.utils.logger import get_logger
 from src.utils.web3_provider import get_web3
@@ -877,9 +878,11 @@ class ProtocolActionExecutor:
     async def _deposit_morpho_vault(self, token: str, amount: Decimal) -> Dict[str, Any]:
         """Deposit into the allowlisted Morpho vault (ERC-4626 deposit).
 
-        Re-verifies the pinned vault config first (defense in depth: the scan
-        already did, but state may have changed since) and refuses amounts
-        above maxDeposit (supply caps full).
+        Re-verifies the pinned vault config and the persisted share-price
+        latch first (defense in depth: the scan already did, but state may
+        have changed since, and a latched trip must block even a deposit the
+        scan never vetted) and refuses amounts above maxDeposit (supply caps
+        full).
         """
         spec, vault = self._morpho_vault(token)
         wallet_address = await self.wallet.get_address()
@@ -887,11 +890,14 @@ class ProtocolActionExecutor:
         if amount_raw <= 0:
             raise ValueError(f"Invalid Morpho vault deposit amount: {amount}")
 
-        verify_vault_config(
+        snapshot = verify_vault_config(
             self.w3,
             spec,
             int(self.config.get("morpho_vault_min_timelock_seconds", DEFAULT_MIN_TIMELOCK_SECONDS)),
             Decimal(str(self.config.get("morpho_vault_max_fee", DEFAULT_MAX_FEE))),
+        )
+        VaultGuardStore(self.config.get("morpho_vault_guard_state_file")).check_share_price(
+            spec.address, spec.label, snapshot.share_price
         )
         max_deposit = vault.functions.maxDeposit(wallet_address).call()
         if amount_raw > max_deposit:
