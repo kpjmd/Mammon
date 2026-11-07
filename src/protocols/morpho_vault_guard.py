@@ -11,8 +11,14 @@ could put the just-exited USDC straight back into the damaged vault.
 Mirrors src/utils/cycle_breaker.py: JSON state file, atomic write. Unlike the
 cycle breaker, an unreadable state file fails CLOSED (every vault reads as
 tripped). Only an explicit operator reset (scripts/reset_morpho_vault_guard.py)
-clears a trip. The file also records the last reason alerted on, so a guard
-failure reaches Discord once per distinct reason rather than every cycle.
+clears a trip. The file also records the last reason (and the last emergency
+exit outcome) alerted on, so Discord hears about each once rather than every
+cycle.
+
+Each latch records its kind. Only a SHARE_PRICE latch (bad debt) makes the
+scheduler auto-exit the vault; an OPERATOR latch (manual exit) and governance
+drift (curator/owner/fee/timelock, re-checked per scan, never latched) hold
+and alert only.
 """
 
 from __future__ import annotations
@@ -22,7 +28,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Set, Tuple
 
 from src.utils.logger import get_logger
 
@@ -35,6 +41,9 @@ DEFAULT_STATE_FILE = "data/morpho_vault_guard.json"
 # 1bp tolerance absorbs lag while still catching any bad-debt event that
 # matters.
 SHARE_PRICE_DROP_TOLERANCE = Decimal("0.0001")
+
+TRIP_SHARE_PRICE = "share_price"
+TRIP_OPERATOR = "operator"
 
 
 class VaultGuardError(Exception):
@@ -54,6 +63,9 @@ class VaultGuardRecord:
     trip_reason: Optional[str] = None
     tripped_at: Optional[str] = None
     last_alerted_reason: Optional[str] = None
+    # Records written before trip_kind existed could only be share-price trips.
+    trip_kind: str = TRIP_SHARE_PRICE
+    last_exit_alert: Optional[str] = None
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "VaultGuardRecord":
@@ -64,6 +76,8 @@ class VaultGuardRecord:
             trip_reason=data.get("trip_reason"),
             tripped_at=data.get("tripped_at"),
             last_alerted_reason=data.get("last_alerted_reason"),
+            trip_kind=data.get("trip_kind") or TRIP_SHARE_PRICE,
+            last_exit_alert=data.get("last_exit_alert"),
         )
 
 
@@ -88,7 +102,10 @@ class VaultGuardStore:
         self._now = now_fn or (lambda: datetime.now(UTC))
         # A trip latched in this process stays latched even if persisting it
         # failed (disk full, permissions): never weaker than in-memory.
-        self._process_trips: Dict[str, str] = {}
+        # vault -> (reason, trip_kind)
+        self._process_trips: Dict[str, Tuple[str, str]] = {}
+        # Alert dedupe that cannot be persisted (state file unreadable).
+        self._unpersisted_alerts: Set[str] = set()
 
     # -- persistence --------------------------------------------------------
     def _load(self) -> Dict[str, VaultGuardRecord]:
@@ -126,7 +143,7 @@ class VaultGuardStore:
         """Raise VaultGuardError if the vault is latched (or state unreadable)."""
         key = vault.lower()
         if key in self._process_trips:
-            raise VaultGuardError(self._process_trips[key])
+            raise VaultGuardError(self._process_trips[key][0])
         record = self._records_or_raise().get(key)
         if record and record.tripped:
             raise VaultGuardError(record.trip_reason or "Morpho vault guard tripped")
@@ -150,7 +167,7 @@ class VaultGuardStore:
                     f"{label}: share price fell {drop:.6%} below its high-water "
                     f"mark ({high_water} -> {share_price}); possible bad debt. "
                     f"Deposits blocked until an operator reset."
-                ))
+                ), TRIP_SHARE_PRICE)
             return  # within tolerance: keep the higher reference
         if high_water is None or share_price > high_water:
             record.high_water_share_price = share_price
@@ -162,14 +179,26 @@ class VaultGuardStore:
         key: str,
         record: VaultGuardRecord,
         reason: str,
+        kind: str,
+    ) -> None:
+        self._mark_tripped(records, key, record, reason, kind)
+        logger.critical(f"🛑 Morpho vault guard LATCHED ({kind}): {reason}")
+        raise VaultGuardError(reason)
+
+    def _mark_tripped(
+        self,
+        records: Dict[str, VaultGuardRecord],
+        key: str,
+        record: VaultGuardRecord,
+        reason: str,
+        kind: str,
     ) -> None:
         record.tripped = True
         record.trip_reason = reason
+        record.trip_kind = kind
         record.tripped_at = self._now().isoformat()
-        self._process_trips[key] = reason
+        self._process_trips[key] = (reason, kind)
         self._save(records)
-        logger.critical(f"🛑 Morpho vault guard LATCHED: {reason}")
-        raise VaultGuardError(reason)
 
     def latch(self, vault: str, reason: str) -> None:
         """Latch a vault as tripped on operator action (e.g. a manual exit).
@@ -183,11 +212,22 @@ class VaultGuardStore:
         except GuardStateUnreadable:
             records = {}
         record = records.setdefault(key, VaultGuardRecord())
-        record.tripped = True
-        record.trip_reason = reason
-        record.tripped_at = self._now().isoformat()
-        self._process_trips[key] = reason
-        self._save(records)
+        self._mark_tripped(records, key, record, reason, TRIP_OPERATOR)
+
+    def latched(self, vault: str) -> Optional[Tuple[str, str]]:
+        """(reason, trip_kind) if the vault is latched, else None.
+
+        Raises:
+            GuardStateUnreadable: The state file is corrupt; the caller must
+                not infer a trip kind (the exit path alerts instead of acting).
+        """
+        key = vault.lower()
+        if key in self._process_trips:
+            return self._process_trips[key]
+        record = self._load().get(key)
+        if record and record.tripped:
+            return (record.trip_reason or "Morpho vault guard tripped", record.trip_kind)
+        return None
 
     def should_alert(self, vault: str, failure: Optional[str]) -> bool:
         """True once per distinct guard-failure reason; clears on recovery.
@@ -199,7 +239,7 @@ class VaultGuardStore:
         try:
             records = self._load()
         except GuardStateUnreadable:
-            return failure is not None
+            return failure is not None and self._first_unpersisted(f"guard:{key}:{failure}")
         record = records.setdefault(key, VaultGuardRecord())
         if failure is None:
             if record.last_alerted_reason is not None and not record.tripped:
@@ -210,6 +250,31 @@ class VaultGuardStore:
             return False
         record.last_alerted_reason = failure
         self._save(records)
+        return True
+
+    def should_alert_exit(self, vault: str, outcome: str) -> bool:
+        """True once per distinct emergency-exit outcome for this vault.
+
+        Keeps a stuck (no-liquidity) or failing exit from alerting every
+        cycle while it retries; any new outcome (e.g. some USDC came out)
+        alerts again.
+        """
+        key = vault.lower()
+        try:
+            records = self._load()
+        except GuardStateUnreadable:
+            return self._first_unpersisted(f"exit:{key}:{outcome}")
+        record = records.setdefault(key, VaultGuardRecord())
+        if record.last_exit_alert == outcome:
+            return False
+        record.last_exit_alert = outcome
+        self._save(records)
+        return True
+
+    def _first_unpersisted(self, token: str) -> bool:
+        if token in self._unpersisted_alerts:
+            return False
+        self._unpersisted_alerts.add(token)
         return True
 
     def snapshot(self) -> Dict[str, VaultGuardRecord]:

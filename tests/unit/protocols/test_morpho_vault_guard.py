@@ -260,36 +260,49 @@ async def test_scheduler_alert_tolerates_plain_protocols(tmp_path):
 
 @pytest.mark.asyncio
 async def test_vault_scan_does_not_block_event_loop(fake, state_file):
-    """Blocking web3 calls must not stall concurrent scans (or wait_for)."""
+    """Blocking web3 calls must not stall concurrent scans (or wait_for).
+
+    Deterministic: the blocking call waits for an event only the event loop
+    can set. If the scan ran on the loop thread, the loop could never set it
+    and the call would time out.
+    """
+    import threading
+
     markets = fake.state[MORPHO]["market"]
+    loop_ran = threading.Event()
+    blocked = []
 
     def slow_market(mid):
-        time.sleep(0.05)  # a slow, blocking RPC round trip
+        if not loop_ran.wait(timeout=5):
+            blocked.append(mid)
         return markets(mid)
 
     fake.state[MORPHO]["market"] = slow_market
-    proto = _protocol(fake, state_file)
-    ticks = 0
 
     async def ticker():
-        nonlocal ticks
         while True:
-            await asyncio.sleep(0.01)
-            ticks += 1
+            await asyncio.sleep(0)
+            loop_ran.set()
 
     task = asyncio.create_task(ticker())
     try:
-        await proto.get_pools()  # 3 markets x 50ms of blocking calls
+        await _protocol(fake, state_file).get_pools()
     finally:
         task.cancel()
-    assert ticks >= 5, "event loop was blocked during the vault scan"
+    assert blocked == [], "event loop was blocked during the vault scan"
 
 
 @pytest.mark.asyncio
 async def test_vault_scan_honours_wait_for_timeout(fake, state_file):
-    fake.state[MORPHO]["market"] = lambda mid: time.sleep(0.5)
+    import threading
+
+    release = threading.Event()
+    fake.state[MORPHO]["market"] = lambda mid: release.wait(timeout=10)
     proto = _protocol(fake, state_file)
     start = time.monotonic()
-    with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(proto.get_pools(), timeout=0.1)
-    assert time.monotonic() - start < 0.4
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(proto.get_pools(), timeout=0.1)
+        assert time.monotonic() - start < 5
+    finally:
+        release.set()  # let the worker thread finish

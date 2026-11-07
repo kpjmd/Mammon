@@ -40,7 +40,7 @@ from src.utils.web3_provider import get_web3
 
 from .base import BaseProtocol, ProtocolPool
 from .morpho_vault_guard import VaultGuardError as VaultGuardError  # re-export
-from .morpho_vault_guard import VaultGuardStore
+from .morpho_vault_guard import GuardStateUnreadable, VaultGuardStore
 
 logger = get_logger(__name__)
 
@@ -370,6 +370,20 @@ def read_vault_state(w3: Web3, spec: VaultSpec, snapshot: VaultSnapshot) -> Vaul
     return state
 
 
+@dataclass
+class LatchedVault:
+    """A vault whose guard is latched, plus what the wallet still holds there.
+
+    `kind` is the trip kind (TRIP_SHARE_PRICE / TRIP_OPERATOR) or None when the
+    guard state file is unreadable, in which case nobody knows why it tripped.
+    """
+
+    spec: VaultSpec
+    reason: str
+    kind: Optional[str]
+    position: Decimal
+
+
 class MorphoVaultProtocol(BaseProtocol):
     """Allowlisted MetaMorpho USDC vault, exposed as the "Morpho" protocol.
 
@@ -434,6 +448,28 @@ class MorphoVaultProtocol(BaseProtocol):
             if self.guard_store.should_alert(spec.address, failure):
                 alerts.append(failure or "")
         return alerts
+
+    async def latched_vaults(self, wallet: str) -> List[LatchedVault]:
+        """Latched vaults with the wallet's on-chain position in each.
+
+        Read by the scheduler's bad-debt auto-exit (which only acts on a
+        share-price latch with a position > 0) and to keep the tracked row
+        of a latched vault, which drops out of scans, in sync with chain.
+        """
+        found = []
+        for spec in self.vaults.values():
+            reason: str
+            kind: Optional[str]
+            try:
+                latched = self.guard_store.latched(spec.address)
+                if latched is None:
+                    continue
+                reason, kind = latched
+            except GuardStateUnreadable as e:
+                reason, kind = f"guard state unreadable: {e}", None
+            position = await self.get_user_balance(spec.pool_id, wallet)
+            found.append(LatchedVault(spec, reason, kind, position))
+        return found
 
     async def _usd_price(self, token: str) -> Decimal:
         try:

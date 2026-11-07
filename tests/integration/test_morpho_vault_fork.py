@@ -197,3 +197,37 @@ async def test_rebalance_executor_idle_to_vault_then_vault_to_moonwell(fork):
     assert move.success, [s.error for s in move.steps]
     assert await protocol.get_user_balance(SPEC.pool_id, DEV_ACCOUNT) == 0
     assert _usdc_balance(fork, DEV_ACCOUNT) == 0  # everything landed in Moonwell
+
+
+@pytest.mark.asyncio
+async def test_bad_debt_latch_auto_exits_on_fork(fork, tmp_path):
+    """A share-price latch makes the scheduler redeem the real position."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from src.protocols.morpho_vault_guard import VaultGuardError, VaultGuardStore
+    from tests.unit.agents.test_optimizer_reconcile import _make_optimizer
+
+    executor, protocol = _build(fork)
+    _fund_usdc(fork, DEV_ACCOUNT, 100 * 10**6)
+    assert (await executor.execute_deposit("Morpho", "USDC", Decimal("100")))["success"]
+
+    # Simulate bad debt: a recorded high-water 2% above today's share price.
+    store = VaultGuardStore()
+    price = (await protocol.get_pools())[0].metadata["share_price"]
+    store.reset()
+    store.check_share_price(SPEC.address, SPEC.label, price * 102 // 100)
+    with pytest.raises(VaultGuardError):
+        store.check_share_price(SPEC.address, SPEC.label, price)
+
+    opt, _ = _make_optimizer(tmp_path, opportunities=[], protocols=[protocol])
+    opt.wallet_manager.address = DEV_ACCOUNT
+    opt.rebalance_executor = MagicMock()
+    opt.rebalance_executor.protocol_executor = executor
+    opt._alerts = MagicMock()
+    opt._alerts.critical = AsyncMock(return_value=True)
+
+    await opt._emergency_exit_tripped_vaults()
+
+    assert await protocol.get_user_balance(SPEC.pool_id, DEV_ACCOUNT) == 0
+    assert _usdc_balance(fork, DEV_ACCOUNT) >= Decimal("99.99999")
+    assert "withdrew" in opt._alerts.critical.await_args.args[1]

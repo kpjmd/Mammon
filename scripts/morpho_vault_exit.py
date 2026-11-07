@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Manually exit the allowlisted Morpho vault (full redeem to the wallet).
 
-For when the vault guard trips (curator/owner/fee/timelock drift or a share
-price drop): the guard blocks NEW deposits and drops the vault from scans, so
-the optimizer will not move funds out on its own. Withdrawals are never gated
-by the guard, so this script can always exit.
+For when the vault guard trips on governance drift (curator/owner/fee/
+timelock) or its state file is unreadable: the guard blocks NEW deposits and
+drops the vault from scans, and the optimizer holds rather than exiting. (A
+share-price/bad-debt latch is exited automatically each cycle; this script is
+still the manual path for it.) Withdrawals are never gated by the guard, so
+this script can always exit.
 
 Dry-run by default: reads the position and the vault's withdrawable liquidity
 and simulates the redeem. Broadcasting requires --live AND typing the

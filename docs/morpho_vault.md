@@ -75,10 +75,11 @@ If any check fails:
   distinct reason. The dedupe survives restarts and resets when the guard
   passes again. An ERROR log line and a CRITICAL `risk_alert` audit event are
   written as well.
-- **The optimizer holds the position.** A venue with no yield data this cycle
-  (guard trip, RPC error, timeout) is never read as 0% APY; the strategy holds
-  it and records a rejected `rebalance` decision ("no yield data"). The same
-  applies to Aave V3 and Moonwell if their scans fail.
+- **The strategy never treats the vault as 0%.** A venue with no yield data
+  this cycle (guard trip, RPC error, timeout) is held, not exited, and a
+  rejected `rebalance` decision ("no yield data") is recorded. The same applies
+  to Aave V3 and Moonwell if their scans fail. Whether the vault is then
+  exited depends on the trip kind (next section).
 - Any vault position stays tracked; reconcile never closes a row it couldn't
   read.
 - **Withdrawals are never gated.** You can always get out.
@@ -87,9 +88,47 @@ Deposits also refuse amounts above `maxDeposit` (vault supply caps full).
 Withdrawals refuse amounts above `maxWithdraw`, which is the vault's
 withdrawable liquidity, before broadcasting anything.
 
-The optimizer will **not** exit the vault on its own when a guard trips: the
-vault vanishes from the scan and the strategy holds. Exit manually when the
-alert arrives:
+## What happens automatically
+
+| Trip | Latched? | Automatic action |
+|---|---|---|
+| **Share price drop** (bad debt) | yes (`trip_kind: share_price`) | **Auto-exit** (below) |
+| Governance drift (asset/core/curator/owner, timelock, fee) | no, re-checked each scan | Hold + alert; exit manually |
+| Operator latch (a manual `morpho_vault_exit.py --live`) | yes (`trip_kind: operator`) | Hold; nothing left to exit |
+| Guard state file unreadable | treated as tripped | Deposits blocked; **no** auto-exit (cause unknown); critical alert `Morpho vault auto-exit suppressed`; exit manually |
+
+**Auto-exit on a share-price latch.** Each cycle, right after the scan and
+before reconcile and the strategy, the scheduler checks every latched vault.
+If the latch is `share_price` and the wallet holds a position on-chain, it
+withdraws to the wallet:
+
+- It calls `execute_withdraw(..., emergency=True)` directly. This is a
+  withdrawal to our own wallet, not a rebalance, so the per-day rebalance cap
+  and the profitability/APY gates don't apply. The wallet's gas-price cap and
+  `DRY_RUN_MODE` still do; in dry run it only logs what it would do.
+- It withdraws `min(position, maxWithdraw)`:
+  - Enough liquidity: every share is redeemed.
+  - Partial: whatever cash the vault has comes out, the alert reports the
+    amount still stuck, and the remainder is retried every cycle.
+  - `maxWithdraw == 0`: nothing is sent; it alerts and retries next cycle.
+- Each withdrawal sends a critical `Morpho vault emergency exit` alert with the
+  tx hash, the amount out and anything still stuck. It also writes an
+  `emergency_exit` decision row, a transaction row and an audit event. Then
+  the vault's position row is reconciled against chain (closed or reduced).
+- A failed or reverted withdraw alerts and the cycle continues; it's retried
+  next cycle. A repeating identical outcome (no liquidity, the same failure, a
+  revert) alerts only once.
+- Nothing is redeposited in the same cycle. The freed USDC is idle capital,
+  and next cycle's idle-deploy picks Aave V3 or Moonwell. The latched vault
+  stays excluded (its scan raises, and the executor refuses the deposit).
+
+The latch stays after the exit. **A reset remains the only way to re-enable
+deposits** (see [Reset](#reset-after-investigating)).
+
+## Manual exit
+
+For governance drift, an unreadable state file, or whenever you'd rather not
+wait for the next cycle, exit manually when the alert arrives:
 
 ```bash
 sudo systemctl stop mammon.service
@@ -105,8 +144,8 @@ sudo systemctl start mammon.service
   non-latching check such as a curator change. The restarted loop therefore
   won't redeposit into the vault.
 
-The next cycle's reconcile closes the vault row and idle-deploy puts the USDC
-into Aave V3 or Moonwell.
+The next cycle reconciles the latched vault's row (closing it) and idle-deploy
+puts the USDC into Aave V3 or Moonwell.
 
 ### Reset after investigating
 
@@ -158,10 +197,11 @@ above if you want it gone.
   `tests/unit/test_morpho_vault_wiring.py`, `tests/unit/test_morpho_vault_exit_script.py`,
   `tests/unit/protocols/test_morpho_vault_guard.py` (persisted latch, alert
   dedupe, non-blocking scan), `tests/unit/strategies/test_missing_venue_yield.py`,
-  `tests/unit/test_reset_morpho_vault_guard.py`.
+  `tests/unit/test_reset_morpho_vault_guard.py`,
+  `tests/unit/agents/test_vault_emergency_exit.py` (auto-exit).
 - Fork E2E against real vault state (deposit → balance → partial withdraw →
-  full redeem, plus a full `RebalanceExecutor` idle→vault→Moonwell round
-  trip):
+  full redeem, a full `RebalanceExecutor` idle→vault→Moonwell round trip, and
+  a share-price-latch auto-exit through the scheduler):
   ```bash
   anvil --fork-url https://mainnet.base.org --port 8546
   MAMMON_FORK_RPC_URL=http://127.0.0.1:8546 \

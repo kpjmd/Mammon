@@ -328,6 +328,7 @@ class ProtocolActionExecutor:
         protocol_name: str,
         token: str,
         amount: Decimal,
+        emergency: bool = False,
     ) -> Dict[str, Any]:
         """Execute protocol-specific withdrawal.
 
@@ -335,6 +336,9 @@ class ProtocolActionExecutor:
             protocol_name: Protocol name (e.g., "Aave V3", "Moonwell", "Morpho")
             token: Token symbol to withdraw
             amount: Amount to withdraw
+            emergency: Morpho only. Withdraw as much as the vault's liquidity
+                allows (partial, or no tx at all) instead of refusing when
+                liquidity is short. Used solely by the bad-debt auto-exit.
 
         Returns:
             Transaction receipt
@@ -343,12 +347,14 @@ class ProtocolActionExecutor:
             NotImplementedError: If protocol not supported
             ValueError: If withdrawal fails
         """
+        if emergency and protocol_name != "Morpho":
+            raise ValueError(f"Emergency withdraw is only defined for Morpho, not {protocol_name}")
         if protocol_name == "Aave V3":
             return await self._withdraw_aave_v3(token, amount)
         elif protocol_name == "Moonwell":
             return await self._withdraw_moonwell(token, amount)
         elif protocol_name == "Morpho":
-            return await self._withdraw_morpho_vault(token, amount)
+            return await self._withdraw_morpho_vault(token, amount, emergency=emergency)
         else:
             raise NotImplementedError(
                 f"Transaction execution not yet supported for {protocol_name}. "
@@ -924,14 +930,41 @@ class ProtocolActionExecutor:
         )
         return await self._vault_result("deposit", spec, token, amount, tx_hash, receipt)
 
-    async def _withdraw_morpho_vault(self, token: str, amount: Decimal) -> Dict[str, Any]:
+    @staticmethod
+    def _plan_vault_withdraw(
+        position_raw: int, amount_raw: int, max_withdraw: int, emergency: bool, scale: Decimal
+    ) -> Tuple[str, int]:
+        """Pick (mode, assets_out_raw) for a vault withdraw.
+
+        mode is "redeem" (every share), "withdraw" (exact assets) or, in
+        emergency mode only, "none" (no liquidity at all: send nothing).
+        """
+        dust_raw = max(int(VAULT_FULL_EXIT_DUST_ABS * scale), int(position_raw * VAULT_FULL_EXIT_DUST_REL))
+        full_exit = amount_raw >= position_raw - dust_raw
+        expected_raw = position_raw if full_exit else amount_raw
+        if expected_raw <= max_withdraw:
+            return ("redeem" if full_exit else "withdraw", expected_raw)
+        if not emergency:
+            raise ValueError(
+                f"withdraw {Decimal(expected_raw) / scale} exceeds available liquidity "
+                f"(maxWithdraw {Decimal(max_withdraw) / scale})"
+            )
+        # Bad-debt exit: take whatever cash the vault has; retry the rest later.
+        return ("none", 0) if max_withdraw == 0 else ("withdraw", max_withdraw)
+
+    async def _withdraw_morpho_vault(
+        self, token: str, amount: Decimal, emergency: bool = False
+    ) -> Dict[str, Any]:
         """Withdraw from the allowlisted Morpho vault.
 
         If `amount` covers (nearly) the whole position, redeem every share so
         no dust is stranded and a stale tracked amount slightly above the real
-        balance cannot revert. Otherwise withdraw exactly `amount`. Either way,
-        refuse before broadcasting if the vault lacks the liquidity
-        (maxWithdraw). Not gated by the vault guard: exits must always work.
+        balance cannot revert. Otherwise withdraw exactly `amount`. Normally
+        refuses before broadcasting if the vault lacks the liquidity
+        (maxWithdraw); with `emergency=True` it withdraws min(request,
+        maxWithdraw) and returns success=False with no tx when maxWithdraw is
+        0. Not gated by the vault guard: exits must always work. Results carry
+        `amount_out` and `remaining` (position left in the vault).
         """
         spec, vault = self._morpho_vault(token)
         wallet_address = await self.wallet.get_address()
@@ -943,42 +976,43 @@ class ProtocolActionExecutor:
         amount_raw = int(amount * scale)
         if amount_raw <= 0:
             raise ValueError(f"Invalid Morpho vault withdraw amount: {amount}")
-
-        dust_raw = max(
-            int(VAULT_FULL_EXIT_DUST_ABS * scale), int(position_raw * VAULT_FULL_EXIT_DUST_REL)
-        )
-        full_exit = amount_raw >= position_raw - dust_raw
-        expected_raw = position_raw if full_exit else amount_raw
         max_withdraw = vault.functions.maxWithdraw(wallet_address).call()
-        if expected_raw > max_withdraw:
-            raise ValueError(
-                f"{spec.label}: withdraw {Decimal(expected_raw) / scale} {token} exceeds "
-                f"available liquidity (maxWithdraw {Decimal(max_withdraw) / scale})"
+        try:
+            mode, out_raw = self._plan_vault_withdraw(
+                position_raw, amount_raw, max_withdraw, emergency, scale
             )
+        except ValueError as e:
+            raise ValueError(f"{spec.label}: {e} {token}") from e
+        amounts = {
+            "mode": mode,
+            "amount_out": Decimal(out_raw) / scale,
+            "remaining": Decimal(position_raw - out_raw) / scale if mode != "redeem" else Decimal(0),
+        }
+        if mode == "none":
+            logger.warning(f"{spec.label}: no withdrawable liquidity; nothing sent")
+            return {"success": False, "error": "vault has no withdrawable liquidity", **amounts}
 
-        mode = "redeem" if full_exit else "withdraw"
-        logger.info(f"Withdrawing {Decimal(expected_raw) / scale} {token} from {spec.label} ({mode})...")
+        logger.info(f"Withdrawing {amounts['amount_out']} {token} from {spec.label} ({mode})...")
         if self.dry_run_mode:
-            logger.info(f"[DRY RUN] Would {mode} {Decimal(expected_raw) / scale} {token} from {spec.label}")
+            logger.info(f"[DRY RUN] Would {mode} {amounts['amount_out']} {token} from {spec.label}")
             return {
                 "success": True,
                 "tx_hash": f"0xdryrun_withdraw_morpho_{token}",
                 "gas_used": 350000,
                 "dry_run": True,
-                "mode": mode,
+                **amounts,
             }
 
         fn = (
             vault.functions.redeem(shares, wallet_address, wallet_address)
-            if full_exit
-            else vault.functions.withdraw(amount_raw, wallet_address, wallet_address)
+            if mode == "redeem"
+            else vault.functions.withdraw(out_raw, wallet_address, wallet_address)
         )
         tx_hash, receipt = await self._send_vault_tx(spec.address, fn, wallet_address)
         result = await self._vault_result(
-            "withdraw", spec, token, Decimal(expected_raw) / scale, tx_hash, receipt
+            "withdraw", spec, token, amounts["amount_out"], tx_hash, receipt
         )
-        result["mode"] = mode
-        return result
+        return {**result, **amounts}
 
     async def _vault_result(
         self,
