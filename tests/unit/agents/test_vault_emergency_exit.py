@@ -324,3 +324,82 @@ async def test_bypasses_daily_rebalance_cap(fake, tmp_path):
     await opt._execute_optimization_cycle()
 
     assert [name for name, _ in _vault_writes(fake)] == ["redeem"]
+
+
+# ===== NO REDEPOSIT IN THE EXIT CYCLE =====
+
+
+def _cycle(opt):
+    """Stub a no-recommendation cycle that has idle USDC to deploy."""
+    opt.reconcile_on_read = False
+    opt._alert_stranded_intents = AsyncMock()
+    opt._check_balance_cap = AsyncMock()
+    opt._get_current_positions = AsyncMock(return_value={})
+    opt._get_idle_capital = AsyncMock(return_value={"USDC": Decimal("100")})
+    opt._deploy_idle_capital = AsyncMock(return_value=[])
+    opt.optimizer.find_rebalance_opportunities = AsyncMock(return_value=[])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("liquidity", [None, "30"], ids=["full", "partial"])
+async def test_exit_cycle_skips_idle_deploy(fake, tmp_path, caplog, liquidity):
+    _trip_share_price(fake)
+    if liquidity:
+        fake.max_withdraw = usdc(liquidity)
+    opt, _, _ = _setup(fake, tmp_path)
+    _cycle(opt)
+
+    with caplog.at_level("INFO"):
+        await opt._execute_optimization_cycle()
+
+    assert len(_vault_writes(fake)) == 1  # the exit tx was sent
+    opt._deploy_idle_capital.assert_not_awaited()
+    assert "Skipping idle deploy this cycle" in caplog.text
+    opt.optimizer.find_rebalance_opportunities.assert_awaited_once()  # strategy still ran
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["no_liquidity", "reverted", "rpc_error", "dry_run"])
+async def test_exit_that_sent_nothing_still_deploys(fake, tmp_path, failure):
+    _trip_share_price(fake)
+    if failure == "no_liquidity":
+        fake.max_withdraw = 0
+    elif failure == "reverted":
+        fake.receipt_status = 0
+    elif failure == "rpc_error":
+        fake.set_vault(maxWithdraw=ConnectionError("rpc down"))
+    opt, _, _ = _setup(fake, tmp_path, dry_run=(failure == "dry_run"))
+    _cycle(opt)
+
+    await opt._execute_optimization_cycle()
+
+    opt._deploy_idle_capital.assert_awaited_once()
+    assert opt._emergency_exit_sent is False
+
+
+@pytest.mark.asyncio
+async def test_next_cycle_deploys_normally(fake, tmp_path):
+    _trip_share_price(fake)
+    opt, _, _ = _setup(fake, tmp_path)
+    send = opt.rebalance_executor.protocol_executor.wallet.send_transaction
+    send.side_effect = lambda to, data, value: (setattr(fake, "wallet_shares", 0) or "0xexit")
+    _cycle(opt)
+
+    await opt._execute_optimization_cycle()
+    opt._deploy_idle_capital.assert_not_awaited()
+
+    await opt._execute_optimization_cycle()  # position gone: no exit this time
+    opt._deploy_idle_capital.assert_awaited_once()
+    assert len(_vault_writes(fake)) == 1
+
+
+@pytest.mark.asyncio
+async def test_exit_flag_reset_each_cycle(fake, tmp_path):
+    opt, _, _ = _setup(fake, tmp_path)
+    _cycle(opt)
+    opt._emergency_exit_sent = True  # left over from a previous cycle
+
+    await opt._execute_optimization_cycle()
+
+    opt._deploy_idle_capital.assert_awaited_once()
+    assert opt._emergency_exit_sent is False

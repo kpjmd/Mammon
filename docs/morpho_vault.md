@@ -118,9 +118,12 @@ withdraws to the wallet:
 - A failed or reverted withdraw alerts and the cycle continues; it's retried
   next cycle. A repeating identical outcome (no liquidity, the same failure, a
   revert) alerts only once.
-- Nothing is redeposited in the same cycle. The freed USDC is idle capital,
-  and next cycle's idle-deploy picks Aave V3 or Moonwell. The latched vault
-  stays excluded (its scan raises, and the executor refuses the deposit).
+- Nothing is redeposited in the same cycle: a cycle whose exit actually sent
+  funds to the wallet skips idle-deploy (log: `Skipping idle deploy this
+  cycle`). The freed USDC deploys on the **next cycle**, about 2h later, to
+  Aave V3 or Moonwell. It still can't go to the latched vault: its scan raises,
+  and the executor refuses the deposit. An attempt that sent nothing (no
+  liquidity, failure, revert, dry run) doesn't skip idle-deploy.
 
 The latch stays after the exit. **A reset remains the only way to re-enable
 deposits** (see [Reset](#reset-after-investigating)).

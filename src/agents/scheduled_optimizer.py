@@ -168,6 +168,9 @@ class ScheduledOptimizer:
         )
         self._last_balance_alert: Optional[datetime] = None
         self._alerts = get_alert_manager()
+        # Set when this cycle's Morpho emergency exit actually sent funds to
+        # the wallet; reset at the start of every cycle.
+        self._emergency_exit_sent = False
 
         # State
         self.status = SchedulerStatus()
@@ -319,6 +322,7 @@ class ScheduledOptimizer:
         # Counted here, not in _run_loop: the autonomous runner drives cycles via
         # run_once(), so a loop-only counter left the heartbeat's total_scans at 0.
         self.status.total_scans += 1
+        self._emergency_exit_sent = False
 
         # Circuit breaker: once tripped, skip ALL action until an operator
         # resets it (scripts/resume_optimizer.py). The process stays alive so
@@ -366,6 +370,15 @@ class ScheduledOptimizer:
                 current_positions, opportunities=opportunities
             )
             await self._record_strategy_rejections()
+
+            if not recommendations and self._emergency_exit_sent:
+                # The runbook promises nothing is redeposited in the cycle that
+                # just exited a bad-debt vault; the freed USDC deploys next cycle.
+                logger.info(
+                    "Skipping idle deploy this cycle: Morpho emergency exit "
+                    "just ran; freed USDC deploys next cycle"
+                )
+                return self._cycle_succeeded(executions)
 
             if not recommendations:
                 # Check if we have idle capital to deploy
@@ -1388,6 +1401,8 @@ class ScheduledOptimizer:
         # Successful withdrawals carry their tx hash, so each is a new outcome;
         # a repeating no-liquidity / failure / revert alerts only once.
         new_outcome = proto.guard_store.should_alert_exit(spec.address, outcome)
+        if tx_hash and result.get("success"):
+            self._emergency_exit_sent = True  # funds reached the wallet
         if tx_hash:
             await self._record_emergency_tx(spec.token, out, result)
         if tx_hash or new_outcome:
