@@ -219,6 +219,17 @@ def _build_default_whitelist() -> Dict[str, ContractInfo]:
             notes="Morpho Blue core protocol",
         ),
         ContractInfo(
+            address="0xeE8F4eC5672F09119b96Ab6fB59C27E1b7e44b61",
+            name="Gauntlet USDC Prime (MetaMorpho vault)",
+            protocol="morpho",
+            contract_type=ContractType.LENDING_POOL,
+            risk_level=RiskLevel.MEDIUM,
+            notes=(
+                "Allowlisted ERC-4626 USDC vault (curator Gauntlet); pinned and "
+                "guarded in src/protocols/morpho_vault.py"
+            ),
+        ),
+        ContractInfo(
             address="0xBAa5CC21fd487B8Fcc2F632f3F4E8D37262a0842",
             name="MORPHO Token",
             protocol="morpho",

@@ -50,8 +50,10 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Only these have working deposit/withdraw + get_user_balance on the live path.
-SUPPORTED_PROTOCOLS = ["Aave V3", "Moonwell"]
+# Protocols with a working get_user_balance on the live path. "Morpho" (the
+# allowlisted vault) is verified even while SUPPORTED_PROTOCOLS keeps it out of
+# trading, so a manually opened or legacy vault position is never invisible.
+SUPPORTED_PROTOCOLS = ["Aave V3", "Moonwell", "Morpho"]
 
 
 def _build_scanner_and_oracle(settings):
@@ -84,6 +86,10 @@ def _build_scanner_and_oracle(settings):
         "morpho_max_markets": getattr(settings, "morpho_max_markets", 5),
         "aerodrome_max_pools": getattr(settings, "aerodrome_max_pools", 10),
         "supported_tokens": getattr(settings, "supported_tokens", ["USDC"]),
+        "morpho_vault_min_timelock_seconds": getattr(
+            settings, "morpho_vault_min_timelock_seconds", 604800
+        ),
+        "morpho_vault_max_fee": getattr(settings, "morpho_vault_max_fee", Decimal("0.05")),
     }
     scanner = YieldScannerAgent(config)
     return scanner, oracle

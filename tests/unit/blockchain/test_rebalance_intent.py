@@ -134,18 +134,19 @@ class TestFullFlow:
         ex._calculate_actual_costs = AsyncMock()
         ex._persist_transactions = AsyncMock()
         ex._requires_swap = MagicMock(return_value=False)
+        ex._deposit_amount = AsyncMock(return_value=Decimal("50"))
 
         async def _withdraw(rec, execution):
             execution.add_step_result(
                 StepResult(step=RebalanceStep.WITHDRAW, success=True, tx_hash="0xw")
             )
 
-        async def _approve(rec, execution):
+        async def _approve(rec, execution, amount=None):
             execution.add_step_result(
                 StepResult(step=RebalanceStep.APPROVE_DEPOSIT, success=True, tx_hash="0xa")
             )
 
-        async def _deposit(rec, execution):
+        async def _deposit(rec, execution, amount=None):
             if deposit_fails:
                 raise RuntimeError("deposit reverted")
             execution.add_step_result(

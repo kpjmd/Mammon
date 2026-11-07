@@ -5,10 +5,14 @@ variables with validation and security checks.
 """
 
 from decimal import Decimal
-from typing import Optional
+from typing import List, Optional
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from src.utils.networks import validate_network, get_supported_networks
+
+# Protocols with a working deposit/withdraw/balance path in
+# ProtocolActionExecutor. "Morpho" = the allowlisted MetaMorpho vault.
+EXECUTABLE_PROTOCOLS = frozenset({"Aave V3", "Moonwell", "Morpho"})
 
 
 class Settings(BaseSettings):
@@ -387,6 +391,29 @@ class Settings(BaseSettings):
         default="ETH,WETH,USDC,USDT,DAI,BTC,WBTC",
         description="Comma-separated list of supported tokens with Chainlink feeds",
     )
+    supported_protocols: str = Field(
+        default="Aave V3,Moonwell",
+        description=(
+            "Comma-separated protocols the strategy may trade into/out of "
+            "(also the idle-deploy allowlist). Allowed: Aave V3, Moonwell, Morpho"
+        ),
+    )
+
+    # Morpho vault guard bounds (src/protocols/morpho_vault.py). A vault whose
+    # on-chain timelock drops below the floor or fee rises above the ceiling is
+    # excluded from scans and refused new deposits.
+    morpho_vault_min_timelock_seconds: int = Field(
+        default=604800,
+        description="Minimum MetaMorpho timelock (seconds) to accept deposits",
+        ge=86400,
+        le=2592000,
+    )
+    morpho_vault_max_fee: Decimal = Field(
+        default=Decimal("0.05"),
+        description="Maximum MetaMorpho performance fee (fraction) to accept deposits",
+        ge=Decimal("0"),
+        le=Decimal("0.5"),
+    )
 
     # Aerodrome BitQuery Integration (Phase 4 Sprint 4)
     aerodrome_use_bitquery: bool = Field(
@@ -551,6 +578,25 @@ class Settings(BaseSettings):
             )
 
         return v.strip()
+
+    @field_validator("supported_protocols")
+    @classmethod
+    def validate_supported_protocols(cls, v: str) -> str:
+        """Fail closed: only protocols with a working executor path are allowed."""
+        names = [p.strip() for p in v.split(",") if p.strip()]
+        if not names:
+            raise ValueError("SUPPORTED_PROTOCOLS must name at least one protocol")
+        unknown = [n for n in names if n not in EXECUTABLE_PROTOCOLS]
+        if unknown:
+            raise ValueError(
+                f"Unsupported protocol(s) {unknown}; allowed: {sorted(EXECUTABLE_PROTOCOLS)}"
+            )
+        return ",".join(names)
+
+    @property
+    def supported_protocols_list(self) -> List[str]:
+        """SUPPORTED_PROTOCOLS as a list (already validated)."""
+        return [p for p in self.supported_protocols.split(",") if p]
 
     @field_validator("network")
     @classmethod

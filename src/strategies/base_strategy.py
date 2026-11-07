@@ -5,7 +5,7 @@ This module defines the interface that all yield strategies must implement.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from decimal import Decimal
 
 
@@ -65,12 +65,14 @@ class RejectedAlternative:
 
     from_protocol: str
     to_protocol: str
-    current_apy: Decimal
+    current_apy: Optional[Decimal]  # None: current venue had no yield data
     target_apy: Decimal
     reason: str
 
     @property
-    def apy_improvement(self) -> Decimal:
+    def apy_improvement(self) -> Optional[Decimal]:
+        if self.current_apy is None:
+            return None
         return self.target_apy - self.current_apy
 
 

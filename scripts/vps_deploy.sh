@@ -181,6 +181,14 @@ MIN_PROFIT_USD=0.50
 # validation at startup. 20 is the ceiling.
 MAX_REBALANCES_PER_DAY=20
 MAX_GAS_PER_DAY_USD=2.0
+# Tradeable venues (strategy + idle-deploy allowlist). Allowed: Aave V3,
+# Moonwell, Morpho. "Morpho" = the allowlisted Gauntlet USDC Prime vault
+# (see docs/morpho_vault.md); add it only after validating on a fork/dry-run.
+SUPPORTED_PROTOCOLS=Aave V3,Moonwell
+# Morpho vault guard bounds: a vault below the timelock floor or above the fee
+# ceiling is excluded from scans and refused new deposits.
+MORPHO_VAULT_MIN_TIMELOCK_SECONDS=604800
+MORPHO_VAULT_MAX_FEE=0.05
 
 # Spending Limits
 MAX_TRANSACTION_VALUE_USD=500

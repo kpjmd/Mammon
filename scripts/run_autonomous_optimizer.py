@@ -160,6 +160,13 @@ class AutonomousRunner:
             "morpho_max_markets": self.settings.morpho_max_markets,
             "aerodrome_max_pools": self.settings.aerodrome_max_pools,
             "supported_tokens": self.settings.supported_tokens,
+            # Tradeable venues (strategy + idle-deploy allowlist). Default is
+            # Aave V3 + Moonwell; "Morpho" (allowlisted vault) is opt-in via
+            # SUPPORTED_PROTOCOLS so merging never changes live behavior.
+            "supported_protocols": self.settings.supported_protocols_list,
+            # Morpho vault guard bounds (scan + pre-deposit re-check).
+            "morpho_vault_min_timelock_seconds": self.settings.morpho_vault_min_timelock_seconds,
+            "morpho_vault_max_fee": self.settings.morpho_vault_max_fee,
             # BitQuery integration settings (Phase 4 Sprint 4)
             "aerodrome_use_bitquery": self.settings.aerodrome_use_bitquery,
             "bitquery_api_key": self.settings.bitquery_api_key,

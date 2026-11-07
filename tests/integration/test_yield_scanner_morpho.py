@@ -181,11 +181,9 @@ async def test_morpho_opportunities_have_lending_metadata(scanner_config):
     morpho_opps = [opp for opp in results if opp.protocol == "Morpho"]
     assert len(morpho_opps) > 0
 
-    # Check lending-specific metadata
+    # "Morpho" is the allowlisted MetaMorpho vault: metadata names the vault.
     morpho_opp = morpho_opps[0]
-    assert "borrow_apy" in morpho_opp.metadata
-    assert "utilization" in morpho_opp.metadata
-    assert "risk_tier" in morpho_opp.metadata
+    assert "vault_address" in morpho_opp.metadata
 
 
 @pytest.mark.asyncio

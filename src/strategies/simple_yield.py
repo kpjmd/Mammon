@@ -68,10 +68,11 @@ class SimpleYieldStrategy(BaseStrategy):
         self.target_token = config.get("target_token", "USDC")
 
         # Protocol whitelist (only fully implemented protocols)
-        # TODO: Implement approval/deposit for: Aerodrome, Morpho
+        # Executable venues: "Aave V3", "Moonwell", "Morpho" (allowlisted vault).
+        # Override via SUPPORTED_PROTOCOLS (wired by the runner's config).
         self.supported_protocols = config.get(
             "supported_protocols",
-            ["Aave V3", "Moonwell"]  # Only these have working approval/deposit
+            ["Aave V3", "Moonwell"]  # Venues validated live end to end
         )
 
         logger.info(
@@ -122,7 +123,15 @@ class SimpleYieldStrategy(BaseStrategy):
                 )
                 continue
 
-            current_apy = available_yields.get(current_protocol, Decimal("0"))
+            if current_protocol not in available_yields:
+                # No yield data for the venue we hold (its scan failed or it
+                # was excluded, e.g. a tripped Morpho vault guard). Reading
+                # that as 0% would recommend an exit on every scan blip, so
+                # hold and leave a trace instead.
+                self._hold_without_yield(current_protocol, available_yields)
+                continue
+
+            current_apy = available_yields[current_protocol]
             logger.info(f"🔍 DEBUG: Current protocol '{current_protocol}' APY lookup: {current_apy}%")
 
             # Find best alternative (highest APY that's not current protocol)
@@ -213,6 +222,27 @@ class SimpleYieldStrategy(BaseStrategy):
 
         logger.info(f"Generated {len(recommendations)} recommendations")
         return recommendations
+
+    def _hold_without_yield(
+        self, current_protocol: str, available_yields: Dict[str, Decimal]
+    ) -> None:
+        """Hold a position whose venue reported no yield this cycle."""
+        alternatives = {
+            p: apy
+            for p, apy in available_yields.items()
+            if p in self.supported_protocols and p != current_protocol
+        }
+        reason = (
+            f"Strategy: holding {current_protocol} — no yield data this cycle "
+            f"(scan failed or venue excluded); not treating it as 0% APY"
+        )
+        logger.info(reason)
+        if not alternatives:
+            return
+        best = max(alternatives, key=alternatives.get)
+        self.last_rejections.append(
+            RejectedAlternative(current_protocol, best, None, alternatives[best], reason)
+        )
 
     def calculate_optimal_allocation(
         self,

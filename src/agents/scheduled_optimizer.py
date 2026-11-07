@@ -23,7 +23,8 @@ from src.strategies.profitability_calculator import ProfitabilityCalculator
 from src.blockchain.rebalance_executor import RebalanceExecutor, RebalanceExecution
 from src.blockchain.wallet import WalletManager
 from src.data.database import Database, BaseRepository
-from src.data.models import Decision, RebalanceIntent
+from src.data.models import Decision, RebalanceIntent, Transaction
+from src.protocols.morpho_vault_guard import TRIP_SHARE_PRICE
 from src.security.audit import AuditLogger, AuditEventType, AuditSeverity
 from src.utils.logger import get_logger
 from src.utils.cycle_breaker import CycleCircuitBreaker
@@ -167,6 +168,9 @@ class ScheduledOptimizer:
         )
         self._last_balance_alert: Optional[datetime] = None
         self._alerts = get_alert_manager()
+        # Set when this cycle's Morpho emergency exit actually sent funds to
+        # the wallet; reset at the start of every cycle.
+        self._emergency_exit_sent = False
 
         # State
         self.status = SchedulerStatus()
@@ -318,6 +322,7 @@ class ScheduledOptimizer:
         # Counted here, not in _run_loop: the autonomous runner drives cycles via
         # run_once(), so a loop-only counter left the heartbeat's total_scans at 0.
         self.status.total_scans += 1
+        self._emergency_exit_sent = False
 
         # Circuit breaker: once tripped, skip ALL action until an operator
         # resets it (scripts/resume_optimizer.py). The process stays alive so
@@ -343,6 +348,10 @@ class ScheduledOptimizer:
             # optimizer (each used to scan on its own, doubling every
             # protocol API/RPC call and error line).
             opportunities = await self._scan_for_cycle()
+            await self._alert_vault_guards()
+            # Bad-debt exit runs before reconcile/strategy and outside the
+            # rebalance gates: it is a withdrawal to our own wallet.
+            await self._emergency_exit_tripped_vaults()
 
             # 0. Reconcile the positions table with on-chain truth before the
             # read below, so decisions see funds moved outside the loop (e.g. a
@@ -361,6 +370,15 @@ class ScheduledOptimizer:
                 current_positions, opportunities=opportunities
             )
             await self._record_strategy_rejections()
+
+            if not recommendations and self._emergency_exit_sent:
+                # The runbook promises nothing is redeposited in the cycle that
+                # just exited a bad-debt vault; the freed USDC deploys next cycle.
+                logger.info(
+                    "Skipping idle deploy this cycle: Morpho emergency exit "
+                    "just ran; freed USDC deploys next cycle"
+                )
+                return self._cycle_succeeded(executions)
 
             if not recommendations:
                 # Check if we have idle capital to deploy
@@ -1234,6 +1252,189 @@ class ScheduledOptimizer:
         self.breaker.record_success()
         self._write_cycle_heartbeat(last_cycle_ok=True)
         return executions
+
+    async def _alert_vault_guards(self) -> None:
+        """Alert (critical, once per distinct reason) on Morpho vault guard trips.
+
+        The protocol layer records guard failures but holds no alerter; any
+        scanned protocol exposing pop_guard_alerts() reports what still needs
+        one. The response (manual exit) is time-sensitive, so this goes to the
+        webhook, not just the log. Best-effort: never fails the cycle.
+        """
+        for proto in getattr(self.yield_scanner, "protocols", None) or []:
+            pop = getattr(proto, "pop_guard_alerts", None)
+            if not callable(pop):
+                continue
+            try:
+                reasons = pop()
+            except Exception as e:  # noqa: BLE001 - alerting must not break a cycle
+                logger.error(f"Vault guard alert check failed: {e}")
+                continue
+            if not isinstance(reasons, list):
+                continue
+            for reason in reasons:
+                await self._safe_alert(
+                    "critical",
+                    "Morpho vault guard tripped",
+                    f"{reason}\nNew deposits are blocked. If you hold a vault "
+                    f"position, exit it: stop mammon.service, run "
+                    f"scripts/morpho_vault_exit.py --live, start the service "
+                    f"(docs/morpho_vault.md).",
+                )
+
+    async def _emergency_exit_tripped_vaults(self) -> None:
+        """Auto-exit vaults latched by the share-price (bad-debt) tripwire.
+
+        Only a SHARE_PRICE latch with an on-chain position triggers a
+        withdrawal. An operator latch or governance drift (never latched)
+        holds; an unreadable guard state alerts only, since the trip's cause
+        is unknown. Not a rebalance: the per-day rebalance cap and the
+        profitability/APY gates do not apply, but the wallet's gas-price cap
+        and dry-run mode do. The freed USDC is idle capital for next cycle;
+        the latched vault stays excluded because its scan raises. Every
+        latched vault's tracked row is reconciled here because the regular
+        reconcile only sees scanned pools. Best-effort: never fails a cycle.
+        """
+        wallet = self.wallet_manager.address
+        if not wallet:
+            return
+        for proto in getattr(self.yield_scanner, "protocols", None) or []:
+            finder = getattr(proto, "latched_vaults", None)
+            if not callable(finder):
+                continue
+            try:
+                latched = await finder(wallet)
+            except Exception as e:  # noqa: BLE001 - never fail the cycle
+                logger.error(f"Emergency exit: could not read latched vaults: {e}")
+                continue
+            if not isinstance(latched, list):
+                continue
+            for vault in latched:
+                await self._handle_latched_vault(proto, vault)
+
+    async def _handle_latched_vault(self, proto: Any, vault: Any) -> None:
+        spec = vault.spec
+        if vault.position > 0:
+            await self._act_on_latched_position(proto, vault)
+        await self.reconcile_positions(
+            [proto.name], opportunities=[self._latched_vault_opportunity(proto, spec)]
+        )
+
+    async def _act_on_latched_position(self, proto: Any, vault: Any) -> None:
+        spec = vault.spec
+        if vault.kind is None:
+            if proto.guard_store.should_alert_exit(spec.address, "unreadable"):
+                await self._safe_alert(
+                    "critical",
+                    "Morpho vault auto-exit suppressed",
+                    f"{vault.reason}\n{vault.position} {spec.token} still in {spec.label}. "
+                    f"Trip cause unknown, so no automatic exit. Inspect the state "
+                    f"file; exit manually with scripts/morpho_vault_exit.py --live.",
+                )
+        elif vault.kind == TRIP_SHARE_PRICE:
+            await self._emergency_exit_vault(proto, vault)
+        else:
+            logger.info(f"{spec.label} latched ({vault.kind}); holding, no auto-exit")
+
+    @staticmethod
+    def _latched_vault_opportunity(proto: Any, spec: Any) -> YieldOpportunity:
+        """A pool entry for reconcile: the latched vault is absent from scans."""
+        return YieldOpportunity(
+            protocol=proto.name,
+            pool_id=spec.pool_id,
+            pool_name=spec.label,
+            apy=Decimal("0"),  # latched: earns nothing we would act on
+            tvl=Decimal("0"),
+            tokens=[spec.token],
+        )
+
+    async def _emergency_exit_vault(self, proto: Any, vault: Any) -> None:
+        """Withdraw min(position, liquidity) from a bad-debt-latched vault."""
+        spec = vault.spec
+        executor = self.rebalance_executor.protocol_executor
+        if self.dry_run_mode and getattr(executor, "dry_run_mode", False) is not True:
+            logger.warning(f"[DRY RUN] Would auto-exit {vault.position} {spec.token} from {spec.label}")
+            return
+        logger.critical(
+            f"🚨 Auto-exiting {vault.position} {spec.token} from {spec.label}: {vault.reason}"
+        )
+        try:
+            result = await executor.execute_withdraw(
+                "Morpho", spec.token, vault.position, emergency=True
+            )
+        except Exception as e:  # noqa: BLE001 - alert and retry next cycle
+            logger.error(f"Emergency exit from {spec.label} failed: {e}", exc_info=True)
+            result = {"success": False, "error": str(e)}
+        if result.get("dry_run"):
+            logger.warning(
+                f"[DRY RUN] Would auto-exit {result.get('amount_out')} {spec.token} "
+                f"from {spec.label} ({result.get('mode')})"
+            )
+            return
+        await self._report_emergency_exit(proto, vault, result)
+
+    async def _report_emergency_exit(self, proto: Any, vault: Any, result: Dict[str, Any]) -> None:
+        """Decision + transaction rows, audit event and (deduped) alert."""
+        spec = vault.spec
+        tx_hash = result.get("tx_hash")
+        out = result.get("amount_out", Decimal("0"))
+        remaining = result.get("remaining", vault.position)
+        if result.get("success"):
+            outcome = f"exited:{tx_hash}" if not remaining else f"partial:{tx_hash}"
+            summary = f"withdrew {out} {spec.token} (tx {tx_hash})"
+            if remaining:
+                summary += f"; {remaining} {spec.token} still stuck, retrying next cycle"
+        elif tx_hash:
+            outcome, summary = "reverted", f"withdraw tx {tx_hash} reverted; retrying next cycle"
+        else:
+            error = result.get("error", "unknown error")
+            outcome, summary = f"failed:{error}", f"no withdrawal ({error}); retrying next cycle"
+
+        await self.audit_logger.log_event(
+            event_type=AuditEventType.RISK_ALERT,
+            severity=AuditSeverity.CRITICAL,
+            message=f"Morpho vault emergency exit: {summary}",
+            metadata={"vault": spec.address, "reason": vault.reason, **{
+                k: str(v) for k, v in result.items() if k in ("tx_hash", "amount_out", "remaining", "mode")
+            }},
+        )
+        # Successful withdrawals carry their tx hash, so each is a new outcome;
+        # a repeating no-liquidity / failure / revert alerts only once.
+        new_outcome = proto.guard_store.should_alert_exit(spec.address, outcome)
+        if tx_hash and result.get("success"):
+            self._emergency_exit_sent = True  # funds reached the wallet
+        if tx_hash:
+            await self._record_emergency_tx(spec.token, out, result)
+        if tx_hash or new_outcome:
+            await self._record_decision(
+                decision_type="emergency_exit",
+                rationale=f"{vault.reason} | {summary}",
+                from_protocol=proto.name,
+                to_protocol=None,
+                approved=1,
+            )
+        if new_outcome:
+            await self._safe_alert("critical", "Morpho vault emergency exit", f"{spec.label}: {summary}")
+
+    async def _record_emergency_tx(self, token: str, amount: Decimal, result: Dict[str, Any]) -> None:
+        if self.database is None:
+            return
+        try:
+            async with self.database.get_session() as session:
+                BaseRepository(session, Transaction).create(
+                    tx_hash=result["tx_hash"],
+                    from_protocol="Morpho",
+                    to_protocol=None,
+                    operation="emergency_exit",
+                    token=token,
+                    amount=amount,
+                    gas_used=result.get("gas_used"),
+                    status="completed" if result.get("success") else "failed",
+                    error_message=result.get("error"),
+                    completed_at=datetime.now(UTC),
+                )
+        except Exception as e:  # noqa: BLE001 - bookkeeping must not fail the exit
+            logger.error(f"Failed to record emergency exit transaction: {e}", exc_info=True)
 
     async def _safe_alert(self, level: str, title: str, message: str) -> None:
         """Fire an alert without ever letting it break the caller."""
