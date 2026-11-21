@@ -63,7 +63,7 @@ def test_timers(unit, schedule_key):
 def test_backup_replicates_off_droplet():
     text = _read("mammon-backup.service")
     # Replication must follow the local backup, not replace or precede it.
-    assert "ExecStartPost=/usr/bin/python3 scripts/replicate_backups.py" in text
+    assert "ExecStartPost=/usr/bin/python3.11 scripts/replicate_backups.py" in text
     assert text.index("ExecStart=") < text.index("ExecStartPost=")
     # Failures must fail the unit (no SuccessExitStatus masking exit 1).
     assert "SuccessExitStatus" not in text
