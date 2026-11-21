@@ -10,12 +10,12 @@ User=root
 # Stdlib-only online-backup (safe against the live writer) + gzip + prune.
 # WorkingDirectory so it reads .env (ALERT_WEBHOOK) and resolves data/ paths.
 WorkingDirectory=/root/mammon
-ExecStart=/usr/bin/python3 scripts/backup_db.py --db data/mammon.db --backup-dir data/backups --keep 14
+ExecStart=/usr/bin/python3.11 scripts/backup_db.py --db data/mammon.db --backup-dir data/backups --keep 14
 # Off-droplet copy, so losing the droplet does not lose the ledger. Runs only
 # after ExecStart succeeded. Uploads via the rclone remote named by BACKUP_REMOTE
 # in .env, which MUST be a crypt remote (enforced); credentials and crypt
 # passwords live in /root/.config/rclone/rclone.conf, never in the repo. Any
 # failure (incl. BACKUP_REMOTE unset) posts an ALERT_WEBHOOK error and fails the
 # unit. Setup: docs/backup_replication.md.
-ExecStartPost=/usr/bin/python3 scripts/replicate_backups.py --backup-dir data/backups
+ExecStartPost=/usr/bin/python3.11 scripts/replicate_backups.py --backup-dir data/backups
 SyslogIdentifier=mammon-backup
